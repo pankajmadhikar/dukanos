@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: dukaanos
+      POSTGRES_PASSWORD: dukaanos
+      POSTGRES_DB: dukaanos
+    ports:
+      - "54329:5432"
+    volumes:
+      - dukaanos_pg:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dukaanos -d dukaanos"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  dukaanos_pg:
