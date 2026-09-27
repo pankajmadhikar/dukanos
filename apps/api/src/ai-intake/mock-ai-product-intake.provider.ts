@@ -1,5 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import {
+  AI_CLIENT_FAILURE,
   AiAnalysisError,
   AiDetectedItem,
   AiProductAnalysis,
@@ -25,6 +26,8 @@ const PARLE: AiDetectedItem = {
  */
 @Injectable()
 export class MockAiProductIntakeProvider implements AiProductIntakeProvider {
+  readonly name = "mock";
+  readonly model = "mock";
   private readonly attempts = new Map<string, number>();
   private gate: Promise<void> = Promise.resolve();
   private openGate: () => void = () => undefined;
@@ -50,7 +53,7 @@ export class MockAiProductIntakeProvider implements AiProductIntakeProvider {
   }
 
   async analyze(input: AiProductIntakeInput): Promise<AiProductAnalysis> {
-    const file = fileName(input.objectKey);
+    const file = (input.fileName ?? fileName(input.objectKey)).toLowerCase();
     if (file.startsWith("hold")) {
       this.markEntered();
       await this.gate;
@@ -62,11 +65,11 @@ export class MockAiProductIntakeProvider implements AiProductIntakeProvider {
       const attempt = (this.attempts.get(input.objectKey) ?? 0) + 1;
       this.attempts.set(input.objectKey, attempt);
       if (attempt === 1) {
-        throw new AiAnalysisError("The image could not be read.");
+        throw new AiAnalysisError(AI_CLIENT_FAILURE, { code: "AI_PROVIDER_UNAVAILABLE", retryable: true });
       }
     }
     if (file.startsWith("unreadable")) {
-      throw new AiAnalysisError("The image could not be read.");
+      throw new AiAnalysisError(AI_CLIENT_FAILURE, { code: "AI_PROVIDER_BAD_REQUEST", retryable: false });
     }
     return { items: itemsFor(file) };
   }

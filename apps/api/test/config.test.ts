@@ -53,12 +53,26 @@ describe("loadAppConfig", () => {
 
   it("accepts an explicit production origin and disables swagger", () => {
     const loaded = loadAppConfig(
-      env({ NODE_ENV: "production", CORS_ORIGINS: "https://shop.example" }),
+      env({
+        NODE_ENV: "production",
+        CORS_ORIGINS: "https://shop.example",
+        AI_PROVIDER: "openai",
+        AI_VISION_MODEL: "gpt-4o-mini",
+        AI_API_KEY: "test-ai-key-value",
+        AI_API_BASE_URL: "https://api.openai.com/v1",
+        OBJECT_STORAGE_PROVIDER: "s3",
+        OBJECT_STORAGE_BUCKET: "intake-private",
+        OBJECT_STORAGE_REGION: "ap-south-1",
+        OBJECT_STORAGE_ACCESS_KEY: "test-access-key",
+        OBJECT_STORAGE_SECRET_KEY: "test-secret-key",
+      }),
     );
     assert.deepEqual(loaded.corsOrigins, ["https://shop.example"]);
     assert.equal(loaded.swaggerEnabled, false);
     assert.equal(loaded.apiPrefix, "api");
     assert.equal(loaded.databaseAppRole, "dukaan_app");
+    assert.equal(loaded.ai.provider, "openai");
+    assert.equal(loaded.storage.provider, "s3");
   });
 
   it("uses localhost origins in development when CORS_ORIGINS is unset", () => {
@@ -74,6 +88,8 @@ describe("loadAppConfig", () => {
     ]);
     assert.equal(loaded.swaggerEnabled, true);
     assert.equal(loaded.otpProvider, "console");
+    assert.equal(loaded.ai.provider, "mock");
+    assert.equal(loaded.storage.provider, "mock");
   });
 
   it("refuses a development OTP provider in production", () => {
@@ -88,5 +104,45 @@ describe("loadAppConfig", () => {
         ),
       /OTP_PROVIDER/,
     );
+  });
+
+  it("refuses mock intake in production and does not echo a provider secret", () => {
+    const secret = "super-secret-ai-key";
+    assert.throws(
+      () =>
+        loadAppConfig(
+          env({
+            NODE_ENV: "production",
+            CORS_ORIGINS: "https://shop.example",
+            AI_PROVIDER: "mock",
+            AI_API_KEY: secret,
+          }),
+        ),
+      (error: Error) => {
+        assert.match(error.message, /AI_PROVIDER must be openai/);
+        assert.equal(error.message.includes(secret), false);
+        return true;
+      },
+    );
+  });
+
+  it("keeps tests on the mock provider even when a real provider is configured", () => {
+    const loaded = loadAppConfig(
+      env({
+        AI_PROVIDER: "openai",
+        AI_VISION_MODEL: "gpt-4o-mini",
+        AI_API_KEY: "test-ai-key-value",
+        AI_API_BASE_URL: "https://api.openai.com/v1",
+        OBJECT_STORAGE_PROVIDER: "s3",
+        OBJECT_STORAGE_BUCKET: "intake-private",
+        OBJECT_STORAGE_REGION: "ap-south-1",
+        OBJECT_STORAGE_ACCESS_KEY: "test-access-key",
+        OBJECT_STORAGE_SECRET_KEY: "test-secret-key",
+      }),
+    );
+    assert.equal(loaded.ai.provider, "mock");
+    assert.equal(loaded.ai.apiKey, "");
+    assert.equal(loaded.storage.provider, "mock");
+    assert.equal(loaded.storage.secretAccessKey, "");
   });
 });

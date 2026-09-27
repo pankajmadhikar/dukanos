@@ -190,13 +190,15 @@ Owners and admins see cost and profit. Stock keepers do not see cost of goods so
 
 ## AI product intake
 
-Camera intake is a draft. `AiIntakeService` creates `ai_intake_sessions` and `ai_intake_items`. It does not insert products, purchases, payments, or inventory rows. A vision provider implements `AiProductIntakeProvider.analyze` and returns suggestions. This phase binds `MockAiProductIntakeProvider`. No OpenAI, Anthropic, Gemini, or other vision API is called, and no provider key is required.
+Camera intake is a draft. `AiIntakeService` creates `ai_intake_sessions` and `ai_intake_items`. It does not insert products, purchases, payments, or inventory rows. A vision provider implements `AiProductIntakeProvider.analyze` and returns suggestions. The shopkeeper confirms. Confirmation calls `ProductService.createWithin` and either `InventoryService.openingWithin` or `PurchaseService.createWithin`. The provider and the worker never call the ledger.
 
 ```text
 POST /api/v1/ai/intake
 POST /api/v1/ai/intake/:intakeId/upload-url
 POST /api/v1/ai/intake/:intakeId/process
+POST /api/v1/ai/intake/:intakeId/retry
 GET  /api/v1/ai/intake/:intakeId
+GET  /api/v1/ai/intake/:intakeId/media-url
 PATCH /api/v1/ai/intake/:intakeId/items/:itemId
 POST /api/v1/ai/intake/:intakeId/items/:itemId/reject
 POST /api/v1/ai/intake/:intakeId/confirm
@@ -204,17 +206,27 @@ POST /api/v1/ai/intake/:intakeId/confirm
 
 The shop comes from the membership grant. `tenantId` in the body is rejected by the validation pipe. `OWNER`, `ADMIN`, and `STOCK_KEEPER` can run intake. `CASHIER` cannot.
 
-Session status moves `UPLOADED → PROCESSING → DRAFT_READY`, or `FAILED`. Processing commits `PROCESSING` before analysis so a second request gets `CONFLICT`. A provider error or timeout then commits `FAILED` with a short safe reason. It does not leave the row in `PROCESSING` for that request. `FAILED` can be processed again. `DRAFT_READY` cannot. There is no `CREATED` status. `DRAFT_READY` is the review state.
+`POST .../process` verifies the private object and returns `QUEUED`. It does not wait for the model. The worker claims the row, calls the provider outside the database transaction, then writes `DRAFT_READY` or `FAILED`. Poll `GET` until one of those statuses. `QUEUED` is derived from `raw_output.job` while the database status is still `UPLOADED`. There is no `CREATED` status. `DRAFT_READY` is the review state. A second process while the job is queued or running returns `CONFLICT`. `DRAFT_READY` cannot be processed again. Editing a suggestion does not call the provider.
 
-Video is rejected. JPEG, PNG, and WEBP are accepted when the MIME type and extension agree, up to 10 MB (`AI_INTAKE_MAX_UPLOAD_BYTES`). `ObjectStorage.createUploadUrl` returns a short-lived PUT URL. Credentials are not stored. The mock storage treats an issued key as present so tests do not upload bytes. A real adapter must check the object after the client PUT. Object key, content type, size, and file name are stored in `raw_output.upload`. Media cleanup is not implemented yet.
+`FAILED` can be retried only when the failure was transient and the attempt count is within `AI_MAX_RETRIES` (default 2). Invalid images and invalid model output are not retried. A `PROCESSING` or `QUEUED` job older than `AI_INTAKE_PROCESSING_TIMEOUT_MINUTES` (default 10) becomes `FAILED` and can be retried. The next read or retry for that shop performs the recovery. There is no cross-shop sweep, because row security hides other shops.
 
-The mock chooses a fixture from the file name (`unreadable`, `fail-once`, `slow`, `unknown`, `low`, `fuzzy`, `sku-match`, `exact-name`, `barcode-match`, `taken-barcode`, `multi`, `rollback`, `no-unit`, `hold`, otherwise Parle-G). Each item stores one confidence on `ai_intake_items.confidence`. Field-level scores are not stored.
+Video is rejected. JPEG, PNG, and WEBP are accepted when the declared type, extension, stored content type, size, and file signature agree, up to 10 MB (`AI_INTAKE_MAX_UPLOAD_BYTES`). The API generates the object key `tenants/{tenantId}/ai-intake/{intakeId}/{fileId}`. A presigned URL is not an upload. Processing checks the object first. Download URLs expire. Credentials are not returned.
 
-Matching reads the shop with indexed lookups, not a full catalog load. Exact barcode, then exact SKU, then exact normalized name set `matched_product_id`. A shared word such as "Parle" can set `possibleProduct` and leaves `matched_product_id` empty until the shopkeeper sends `matchedProductId`. Below `AI_INTAKE_CONFIDENCE_THRESHOLD` (default 0.85) the item stays `needsReview`. Nothing is confirmed automatically.
+`AI_PROVIDER=mock` and `OBJECT_STORAGE_PROVIDER=mock` are the development defaults. Tests force both, even if a real provider is present in the environment. Production refuses mock AI and mock storage. `AI_PROVIDER=openai` uses `OpenAiVisionIntakeProvider` with `AI_API_KEY`, `AI_VISION_MODEL`, and `AI_API_BASE_URL`. `OBJECT_STORAGE_PROVIDER=s3` uses a private S3-compatible bucket. Provider errors are stored as codes such as `AI_PROVIDER_TIMEOUT`. The shop sees `We could not process this image. Please try again.` Logs record provider, model, duration, size, and item count. They do not record keys, image bytes, or presigned URLs.
+
+The model output is validated before any draft row is written. Missing barcode, SKU, quantity, and prices stay null. An invalid payload fails the whole analysis. The mock still selects a fixture from the original file name (`unreadable`, `fail-once`, `slow`, `unknown`, `low`, `fuzzy`, `sku-match`, `exact-name`, `barcode-match`, `taken-barcode`, `multi`, `rollback`, `no-unit`, `hold`, otherwise Parle-G). Each item stores one confidence on `ai_intake_items.confidence`. Field-level scores are not a column. Evidence, when the provider sends it, stays in `raw_suggestion`.
+
+Matching reads the shop with indexed lookups, not a full catalog load. Exact barcode, then exact SKU, then exact normalized name set `matched_product_id`. A shared word such as "Parle" can set `possibleProduct` and leaves `matched_product_id` empty until the shopkeeper sends `matchedProductId`. Below `AI_CONFIDENCE_THRESHOLD` (default 0.85, also read from `AI_INTAKE_CONFIDENCE_THRESHOLD`) the item stays `needsReview`. Nothing is confirmed automatically.
+
+Processing is limited per minute in memory (`AI_INTAKE_MAX_REQUESTS_PER_MINUTE`, default 60) for the shop, the user, and the client IP. A rolling day cap (`AI_INTAKE_MAX_DAILY_PROCESSES`, default 500) counts `ai_intake.processed` and `ai_intake.processing_failed` in `audit_logs`. The minute window is not shared across API processes.
+
+Abandoned `UPLOADED` media, failed media, and confirmed media are deleted after `AI_INTAKE_MEDIA_RETENTION_DAYS` (default 30). `QUEUED`, `PROCESSING`, and `DRAFT_READY` are kept. Cleanup runs for the current shop when that shop uses intake. It does not scan other shops.
 
 `POST .../confirm` with `CREATE_PRODUCT_ONLY` calls `ProductService.createWithin` for new products and leaves stock untouched. `CREATE_PRODUCT_AND_STOCK` also posts stock when quantity and purchase price are both present. With `supplierId` that is one `PurchaseService.createWithin` call, so the purchase number comes from `next_document_number`. Without a supplier it calls `InventoryService.openingWithin` for each stock line. Missing quantity or purchase price does not invent a value. Confirmation of an existing `matched_product_id` does not create a second product. The same transaction marks the items `ACCEPTED` and the session `CONFIRMED` when no `PENDING` items remain. A failure rolls the product, stock, and draft status back together. The same `Idempotency-Key` and body returns the stored result. A different body returns `IDEMPOTENCY_CONFLICT`.
 
-Audit rows are `ai_intake.created`, `ai_intake.processed`, `ai_intake.item_updated`, `ai_intake.item_rejected`, and `ai_intake.confirmed`, plus the catalog, opening, or purchase events those services already write.
+Audit rows are `ai_intake.created`, `ai_intake.media_uploaded`, `ai_intake.processed`, `ai_intake.processing_failed`, `ai_intake.processing_retried`, `ai_intake.media_deleted`, `ai_intake.item_updated`, `ai_intake.item_rejected`, and `ai_intake.confirmed`, plus the catalog, opening, or purchase events those services already write.
+
+The queue is in-process. It is not Redis. The database row lock is what stops two workers from analyzing the same intake.
 
 ## Health and docs
 
@@ -233,4 +245,4 @@ Liveness does not touch PostgreSQL. Readiness runs `SELECT 1`. Swagger is mounte
 
 ## What is intentionally absent
 
-Password and PIN login, invite and recovery OTP, membership administration beyond the creating owner, sale voids, GST filing, payroll, and a production vision provider. Video intake, media retention, and per-field confidence are not implemented. Catalog creates products and does not create stock. AI intake does not create stock either. The shopkeeper confirms, and then catalog, opening stock, or purchases write the ledger. Inventory posts opening stock and adjustments through the ledger. Purchases post stock only by calling that ledger, and they record the unpaid bill on the supplier payable ledger rather than as a payment. Sales post stock only by calling that ledger, record payments received, and record the unpaid remainder as customer receivable. Sales returns and purchase returns post stock only by calling that ledger.
+Password and PIN login, invite and recovery OTP, membership administration beyond the creating owner, sale voids, GST filing, payroll, video intake, and per-field confidence. The intake queue and the per-minute limit live in one API process. They are not a shared Redis queue. Catalog creates products and does not create stock. AI intake does not create stock either. The shopkeeper confirms, and then catalog, opening stock, or purchases write the ledger. Inventory posts opening stock and adjustments through the ledger. Purchases post stock only by calling that ledger, and they record the unpaid bill on the supplier payable ledger rather than as a payment. Sales post stock only by calling that ledger, record payments received, and record the unpaid remainder as customer receivable. Sales returns and purchase returns post stock only by calling that ledger.

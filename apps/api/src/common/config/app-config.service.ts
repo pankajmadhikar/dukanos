@@ -1,10 +1,12 @@
 import { Injectable } from "@nestjs/common";
 import {
+  AiConfig,
   AppConfig,
   loadAppConfig,
   LogLevel,
   NodeEnvironment,
   OtpProviderName,
+  StorageConfig,
 } from "./load-app-config";
 
 @Injectable()
@@ -26,6 +28,8 @@ export class AppConfigService {
   readonly otpRequestLimit: number;
   readonly otpRequestWindowSeconds: number;
   readonly otpIpLimit: number;
+  readonly ai: AiConfig;
+  readonly storage: StorageConfig;
 
   constructor() {
     const loaded: AppConfig = loadAppConfig(process.env);
@@ -46,5 +50,7 @@ export class AppConfigService {
     this.otpRequestLimit = loaded.otpRequestLimit;
     this.otpRequestWindowSeconds = loaded.otpRequestWindowSeconds;
     this.otpIpLimit = loaded.otpIpLimit;
+    this.ai = loaded.ai;
+    this.storage = loaded.storage;
   }
 }

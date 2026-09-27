@@ -8,7 +8,10 @@ import { NestFactory } from "@nestjs/core";
 import { Client } from "pg";
 import request, { Response } from "supertest";
 import { AppModule } from "../src/app.module";
+import { AiIntakeService } from "../src/ai-intake/ai-intake.service";
+import { imageSignatureSample } from "../src/ai-intake/intake-media";
 import { MockAiProductIntakeProvider } from "../src/ai-intake/mock-ai-product-intake.provider";
+import { MockObjectStorage } from "../src/ai-intake/object-storage";
 import { CapturingOtpSender } from "../src/auth/capturing-otp-sender";
 import { OTP_SENDER } from "../src/auth/otp-sender";
 import { normalizeIndianPhone } from "../src/auth/phone";
@@ -31,7 +34,10 @@ describe("ai intake", () => {
   let admin: Client;
   let sender: CapturingOtpSender;
   let provider: MockAiProductIntakeProvider;
+  let storage: MockObjectStorage;
+  let intake: AiIntakeService;
   let ownerToken = "";
+  let ownerUserId = "";
   let ownerShop = "";
   let shopId = "";
   let adminToken = "";
@@ -41,6 +47,8 @@ describe("ai intake", () => {
   let stockToken = "";
   let stockShop = "";
   let otherToken = "";
+  let otherUserId = "";
+  let otherShopId = "";
   let otherShop = "";
   let unitId = "";
 
@@ -52,9 +60,12 @@ describe("ai intake", () => {
     await app.init();
     sender = app.get<CapturingOtpSender>(OTP_SENDER);
     provider = app.get(MockAiProductIntakeProvider);
+    storage = app.get(MockObjectStorage);
+    intake = app.get(AiIntakeService);
 
     const owner = await login(nextNational());
     ownerToken = owner.token;
+    ownerUserId = owner.userId;
     const created = await createShop(ownerToken, "[AI] Shop A");
     shopId = created.id;
     ownerShop = created.shopContext;
@@ -84,7 +95,9 @@ describe("ai intake", () => {
     stockToken = stock.token;
     stockShop = await selectShop(stock.token, shopId);
     otherToken = other.token;
+    otherUserId = other.userId;
     const otherCreated = await createShop(other.token, "[AI] Shop B");
+    otherShopId = otherCreated.id;
     otherShop = otherCreated.shopContext;
 
     const unit = await authed(ownerToken, ownerShop)
@@ -173,6 +186,8 @@ describe("ai intake", () => {
     assert.equal(uploaded.body.data.method, "PUT");
     assert.equal(uploaded.body.data.headers["content-type"], "image/jpeg");
     assert.match(uploaded.body.data.url, /^http:\/\/127\.0\.0\.1\/mock-storage\//);
+    assert.match(uploaded.body.data.objectKey, new RegExp(`^tenants/${shopId}/ai-intake/${intakeId}/`));
+    assert.equal(String(uploaded.body.data.objectKey).includes("shop-products"), false);
     assert.equal(JSON.stringify(uploaded.body).includes("secret"), false);
     assert.equal(typeof uploaded.body.data.expiresAt, "string");
 
@@ -186,9 +201,11 @@ describe("ai intake", () => {
   it("does not process twice and does not create stock before confirmation", async () => {
     const before = await counts();
     const intakeId = await prepare(ownerToken, ownerShop, "shop-products.jpg");
-    const processed = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
-    assert.equal(processed.status, 200, JSON.stringify(processed.body));
-    assert.equal(processed.body.data.status, "DRAFT_READY");
+    const queued = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
+    assert.equal(queued.status, 200, JSON.stringify(queued.body));
+    assert.equal(queued.body.data.status, "QUEUED");
+    assert.equal(queued.body.data.items.length, 0);
+    const processed = await waitStatus(ownerToken, ownerShop, intakeId, "DRAFT_READY");
     assert.equal(processed.body.data.media.contentType, "image/jpeg");
     assert.equal(processed.body.data.items.length, 1);
     const item = processed.body.data.items[0];
@@ -218,15 +235,16 @@ describe("ai intake", () => {
   it("keeps a failed analysis from creating products and allows a retry", async () => {
     const before = await counts();
     const failedId = await prepare(ownerToken, ownerShop, "unreadable.jpg");
-    const failed = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${failedId}/process`);
-    assert.equal(failed.status, 422, JSON.stringify(failed.body));
-    assert.equal(failed.body.error.code, "AI_INTAKE_FAILED");
-    assert.equal(failed.body.error.message.includes("stack"), false);
-    const saved = await authed(ownerToken, ownerShop).get(`/api/v1/ai/intake/${failedId}`);
-    assert.equal(saved.status, 200, JSON.stringify(saved.body));
-    assert.equal(saved.body.data.status, "FAILED");
+    const queued = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${failedId}/process`);
+    assert.equal(queued.status, 200, JSON.stringify(queued.body));
+    assert.equal(queued.body.data.status, "QUEUED");
+    const saved = await waitStatus(ownerToken, ownerShop, failedId, "FAILED");
     assert.equal(saved.body.data.items.length, 0);
-    assert.equal(saved.body.data.failureReason, "The image could not be read.");
+    assert.equal(saved.body.data.failureReason, "We could not process this image. Please try again.");
+    assert.equal(JSON.stringify(saved.body).includes("AI_API_KEY"), false);
+    const denied = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${failedId}/retry`);
+    assert.equal(denied.status, 409, JSON.stringify(denied.body));
+    assert.equal(denied.body.error.code, "AI_INTAKE_NOT_RETRYABLE");
     const after = await counts();
     assert.equal(after.products, before.products);
     assert.equal(after.purchases, before.purchases);
@@ -235,10 +253,9 @@ describe("ai intake", () => {
 
     const retryId = await prepare(ownerToken, ownerShop, "fail-once.jpg");
     const first = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${retryId}/process`);
-    assert.equal(first.status, 422, JSON.stringify(first.body));
-    const second = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${retryId}/process`);
-    assert.equal(second.status, 200, JSON.stringify(second.body));
-    assert.equal(second.body.data.status, "DRAFT_READY");
+    assert.equal(first.status, 200, JSON.stringify(first.body));
+    assert.equal(first.body.data.status, "QUEUED");
+    const second = await waitStatus(ownerToken, ownerShop, retryId, "DRAFT_READY");
     assert.equal(second.body.data.items[0].name, "Parle-G Biscuits");
     const still = await counts();
     assert.equal(still.products, before.products);
@@ -249,39 +266,29 @@ describe("ai intake", () => {
     process.env.AI_INTAKE_PROVIDER_TIMEOUT_MS = "30";
     try {
       const timed = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
-      assert.equal(timed.status, 422, JSON.stringify(timed.body));
-      assert.equal(timed.body.error.code, "AI_INTAKE_FAILED");
+      assert.equal(timed.status, 200, JSON.stringify(timed.body));
+      assert.equal(timed.body.data.status, "QUEUED");
+      const saved = await waitStatus(ownerToken, ownerShop, intakeId, "FAILED");
+      assert.equal(saved.body.data.items.length, 0);
     } finally {
       delete process.env.AI_INTAKE_PROVIDER_TIMEOUT_MS;
     }
-    const saved = await authed(ownerToken, ownerShop).get(`/api/v1/ai/intake/${intakeId}`);
-    assert.equal(saved.body.data.status, "FAILED");
-    assert.equal(saved.body.data.items.length, 0);
   });
 
   it("rejects a second process while the first is still running", async () => {
     const intakeId = await prepare(ownerToken, ownerShop, "hold.jpg");
     provider.armHold();
     try {
-      const firstPromise = new Promise<Response>((resolve, reject) => {
-        authed(ownerToken, ownerShop)
-          .post(`/api/v1/ai/intake/${intakeId}/process`)
-          .end((error, response) => {
-            if (error) {
-              reject(error);
-            } else {
-              resolve(response);
-            }
-          });
-      });
+      const first = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
+      assert.equal(first.status, 200, JSON.stringify(first.body));
+      assert.equal(first.body.data.status, "QUEUED");
       await provider.whenEntered();
       const second = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
       assert.equal(second.status, 409, JSON.stringify(second.body));
       assert.equal(second.body.error.code, "CONFLICT");
       provider.release();
-      const first = await firstPromise;
-      assert.equal(first.status, 200, JSON.stringify(first.body));
-      assert.equal(first.body.data.items.length, 1);
+      const ready = await waitStatus(ownerToken, ownerShop, intakeId, "DRAFT_READY");
+      assert.equal(ready.body.data.items.length, 1);
     } finally {
       provider.release();
     }
@@ -290,31 +297,27 @@ describe("ai intake", () => {
   it("matches barcode, SKU, and exact name, and keeps fuzzy names for review", async () => {
     const barcodeProduct = await createProduct("Existing Biscuits", { barcode: "8901999888777" });
     const barcodeIntake = await prepare(ownerToken, ownerShop, "barcode-match.jpg");
-    const barcodeView = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${barcodeIntake}/process`);
-    assert.equal(barcodeView.status, 200, JSON.stringify(barcodeView.body));
+    const barcodeView = await analyzed(ownerToken, ownerShop, barcodeIntake);
     assert.equal(barcodeView.body.data.items[0].matchType, "EXACT_BARCODE_MATCH");
     assert.equal(barcodeView.body.data.items[0].matchedProduct.id, barcodeProduct);
     assert.equal(barcodeView.body.data.items[0].needsReview, false);
 
     const skuProduct = await createProduct("Shop Biscuits", { sku: "PARLE-G" });
     const skuIntake = await prepare(ownerToken, ownerShop, "sku-match.jpg");
-    const skuView = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${skuIntake}/process`);
-    assert.equal(skuView.status, 200, JSON.stringify(skuView.body));
+    const skuView = await analyzed(ownerToken, ownerShop, skuIntake);
     assert.equal(skuView.body.data.items[0].matchType, "EXACT_SKU_MATCH");
     assert.equal(skuView.body.data.items[0].matchedProduct.id, skuProduct);
     assert.equal(skuView.body.data.items[0].sku, "PARLE-G");
 
     await createProduct("Groundnut Oil");
     const nameIntake = await prepare(ownerToken, ownerShop, "exact-name.jpg");
-    const nameView = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${nameIntake}/process`);
-    assert.equal(nameView.status, 200, JSON.stringify(nameView.body));
+    const nameView = await analyzed(ownerToken, ownerShop, nameIntake);
     assert.equal(nameView.body.data.items[0].matchType, "EXACT_NAME_MATCH");
     assert.equal(nameView.body.data.items[0].matchedProduct.name, "Groundnut Oil");
 
     const similar = await createProduct("Parle-G 250 Gram");
     const fuzzyIntake = await prepare(ownerToken, ownerShop, "fuzzy.jpg");
-    const fuzzyView = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${fuzzyIntake}/process`);
-    assert.equal(fuzzyView.status, 200, JSON.stringify(fuzzyView.body));
+    const fuzzyView = await analyzed(ownerToken, ownerShop, fuzzyIntake);
     const fuzzy = fuzzyView.body.data.items[0];
     assert.equal(fuzzy.matchType, "POSSIBLE_MATCH");
     assert.equal(fuzzy.reviewStatus, "NEEDS_REVIEW");
@@ -338,8 +341,7 @@ describe("ai intake", () => {
     assert.equal(await productCount(), before);
 
     const unknownId = await prepare(ownerToken, ownerShop, "unknown.jpg");
-    const unknown = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${unknownId}/process`);
-    assert.equal(unknown.status, 200, JSON.stringify(unknown.body));
+    const unknown = await analyzed(ownerToken, ownerShop, unknownId);
     assert.equal(unknown.body.data.items[0].name, "Unknown Product");
     assert.equal(unknown.body.data.items[0].matchType, "NEW_PRODUCT");
     assert.equal(unknown.body.data.items[0].matchedProduct, null);
@@ -350,8 +352,7 @@ describe("ai intake", () => {
   it("edits and rejects drafts without writing the catalog", async () => {
     const before = await productCount();
     const intakeId = await prepare(ownerToken, ownerShop, "low.jpg");
-    const processed = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
-    assert.equal(processed.status, 200, JSON.stringify(processed.body));
+    const processed = await analyzed(ownerToken, ownerShop, intakeId);
     const itemId = processed.body.data.items[0].id as string;
     assert.equal(processed.body.data.items[0].reviewStatus, "NEEDS_REVIEW");
     assert.equal(await productCount(), before);
@@ -376,6 +377,8 @@ describe("ai intake", () => {
     assert.equal(edited.body.data.name, "Loose Leaf Tea");
     assert.equal(edited.body.data.quantity, "3.000");
     assert.equal(edited.body.data.status, "PENDING");
+    const unchanged = await authed(ownerToken, ownerShop).get(`/api/v1/ai/intake/${intakeId}`);
+    assert.equal(unchanged.body.data.status, "DRAFT_READY");
 
     const rejected = await authed(ownerToken, ownerShop).post(
       `/api/v1/ai/intake/${intakeId}/items/${itemId}/reject`,
@@ -395,8 +398,7 @@ describe("ai intake", () => {
     const before = await counts();
     const openings = await auditCount("inventory.opening_created");
     const intakeId = await prepare(ownerToken, ownerShop, "parle-confirm.jpg");
-    const processed = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
-    assert.equal(processed.status, 200, JSON.stringify(processed.body));
+    const processed = await analyzed(ownerToken, ownerShop, intakeId);
     const mid = await counts();
     assert.equal(mid.products, before.products);
     assert.equal(mid.movements, before.movements);
@@ -490,8 +492,7 @@ describe("ai intake", () => {
     const expectedNumber = await nextPurchaseNumber();
 
     const intakeId = await prepare(ownerToken, ownerShop, "rice-bill.jpg");
-    const processed = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
-    assert.equal(processed.status, 200, JSON.stringify(processed.body));
+    const processed = await analyzed(ownerToken, ownerShop, intakeId);
     const itemId = processed.body.data.items[0].id as string;
     const linked = await authed(ownerToken, ownerShop)
       .patch(`/api/v1/ai/intake/${intakeId}/items/${itemId}`)
@@ -524,8 +525,7 @@ describe("ai intake", () => {
 
   it("creates a product without stock when stock figures are absent", async () => {
     const intakeId = await prepare(ownerToken, ownerShop, "exact-name-only.jpg");
-    const processed = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
-    assert.equal(processed.status, 200, JSON.stringify(processed.body));
+    const processed = await analyzed(ownerToken, ownerShop, intakeId);
     assert.equal(processed.body.data.items[0].matchType, "EXACT_NAME_MATCH");
     const beforeMoves = await counts();
     const confirmed = await authed(ownerToken, ownerShop)
@@ -547,8 +547,7 @@ describe("ai intake", () => {
     assert.equal(off.status, 200, JSON.stringify(off.body));
     const before = await productCount();
     const intakeId = await prepare(ownerToken, ownerShop, "taken-barcode.jpg");
-    const processed = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
-    assert.equal(processed.status, 200, JSON.stringify(processed.body));
+    const processed = await analyzed(ownerToken, ownerShop, intakeId);
     assert.equal(processed.body.data.items[0].matchedProduct, null);
     const denied = await authed(ownerToken, ownerShop)
       .post(`/api/v1/ai/intake/${intakeId}/confirm`)
@@ -561,8 +560,7 @@ describe("ai intake", () => {
     assert.equal(still.body.data.items[0].status, "PENDING");
 
     const rollbackId = await prepare(ownerToken, ownerShop, "rollback.jpg");
-    const drafts = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${rollbackId}/process`);
-    assert.equal(drafts.status, 200, JSON.stringify(drafts.body));
+    await analyzed(ownerToken, ownerShop, rollbackId);
     const failed = await authed(ownerToken, ownerShop)
       .post(`/api/v1/ai/intake/${rollbackId}/confirm`)
       .send({ mode: "CREATE_PRODUCT_ONLY" });
@@ -579,7 +577,7 @@ describe("ai intake", () => {
     assert.equal(open.body.data.items.every((item: { status: string }) => item.status === "PENDING"), true);
 
     const noUnit = await prepare(ownerToken, ownerShop, "no-unit.jpg");
-    await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${noUnit}/process`);
+    await analyzed(ownerToken, ownerShop, noUnit);
     const missingUnit = await authed(ownerToken, ownerShop)
       .post(`/api/v1/ai/intake/${noUnit}/confirm`)
       .send({ mode: "CREATE_PRODUCT_ONLY" });
@@ -593,8 +591,7 @@ describe("ai intake", () => {
 
   it("confirms every selected item in one request", async () => {
     const intakeId = await prepare(ownerToken, ownerShop, "multi.jpg");
-    const processed = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
-    assert.equal(processed.status, 200, JSON.stringify(processed.body));
+    const processed = await analyzed(ownerToken, ownerShop, intakeId);
     assert.equal(processed.body.data.items.length, 2);
     const confirmed = await authed(adminToken, adminShop)
       .post(`/api/v1/ai/intake/${intakeId}/confirm`)
@@ -609,6 +606,122 @@ describe("ai intake", () => {
         [item.productId],
       );
       assert.equal(rows.rows.length, 1);
+    }
+  });
+
+  it("keeps intake media inside the shop that uploaded it", async () => {
+    const intakeId = await prepare(ownerToken, ownerShop, "private.jpg");
+    const media = await authed(ownerToken, ownerShop).get(`/api/v1/ai/intake/${intakeId}/media-url`);
+    assert.equal(media.status, 200, JSON.stringify(media.body));
+    assert.match(media.body.data.url, /^http:\/\/127\.0\.0\.1\/mock-storage\/download\//);
+    assert.equal(typeof media.body.data.expiresAt, "string");
+    assert.equal(JSON.stringify(media.body).includes("secret"), false);
+
+    const otherMedia = await authed(otherToken, otherShop).get(`/api/v1/ai/intake/${intakeId}/media-url`);
+    assert.equal(otherMedia.status, 404);
+    const otherProcess = await authed(otherToken, otherShop).post(`/api/v1/ai/intake/${intakeId}/process`);
+    assert.equal(otherProcess.status, 404);
+    const otherRetry = await authed(otherToken, otherShop).post(`/api/v1/ai/intake/${intakeId}/retry`);
+    assert.equal(otherRetry.status, 404);
+
+    await intake.runJob({ tenantId: otherShopId, userId: otherUserId, role: "OWNER", intakeId });
+    const unchanged = await authed(ownerToken, ownerShop).get(`/api/v1/ai/intake/${intakeId}`);
+    assert.equal(unchanged.status, 200, JSON.stringify(unchanged.body));
+    assert.equal(unchanged.body.data.status, "UPLOADED");
+    assert.equal(unchanged.body.data.items.length, 0);
+  });
+
+  it("rejects an upload that was not stored or does not match the declared image", async () => {
+    const missingId = await createIntake(ownerToken, ownerShop);
+    const issued = await authed(ownerToken, ownerShop)
+      .post(`/api/v1/ai/intake/${missingId}/upload-url`)
+      .send({ fileName: "missing.jpg", contentType: "image/jpeg", size: 64 });
+    assert.equal(issued.status, 200, JSON.stringify(issued.body));
+    const missing = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${missingId}/process`);
+    assert.equal(missing.status, 409, JSON.stringify(missing.body));
+    assert.equal(missing.body.error.code, "AI_INTAKE_UPLOAD_NOT_VERIFIED");
+
+    const mismatchId = await createIntake(ownerToken, ownerShop);
+    const mismatchUpload = await authed(ownerToken, ownerShop)
+      .post(`/api/v1/ai/intake/${mismatchId}/upload-url`)
+      .send({ fileName: "wrong.jpg", contentType: "image/jpeg", size: 64 });
+    await storage.put(mismatchUpload.body.data.objectKey as string, {
+      contentType: "image/png",
+      bytes: imageSignatureSample("image/png", 64),
+    });
+    const mismatch = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${mismatchId}/process`);
+    assert.equal(mismatch.status, 400, JSON.stringify(mismatch.body));
+    assert.equal(mismatch.body.error.code, "AI_INTAKE_MEDIA_INVALID");
+
+    const pngId = await prepare(ownerToken, ownerShop, "shelf.png", "image/png");
+    const png = await analyzed(ownerToken, ownerShop, pngId);
+    assert.equal(png.body.data.status, "DRAFT_READY");
+    const webpId = await prepare(ownerToken, ownerShop, "shelf.webp", "image/webp");
+    const webp = await analyzed(ownerToken, ownerShop, webpId);
+    assert.equal(webp.body.data.status, "DRAFT_READY");
+  });
+
+  it("recovers a stale processing session and enforces the retry limit", async () => {
+    const intakeId = await prepare(ownerToken, ownerShop, "hold.jpg");
+    provider.armHold();
+    try {
+      const queued = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/process`);
+      assert.equal(queued.status, 200, JSON.stringify(queued.body));
+      await provider.whenEntered();
+      process.env.AI_INTAKE_PROCESSING_TIMEOUT_MINUTES = "0";
+      await delay(20);
+      const stale = await authed(ownerToken, ownerShop).get(`/api/v1/ai/intake/${intakeId}`);
+      assert.equal(stale.body.data.status, "FAILED", JSON.stringify(stale.body));
+      assert.equal(stale.body.data.canRetry, true);
+      provider.release();
+      await delay(30);
+      const still = await authed(ownerToken, ownerShop).get(`/api/v1/ai/intake/${intakeId}`);
+      assert.equal(still.body.data.status, "FAILED");
+      const retried = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${intakeId}/retry`);
+      assert.equal(retried.status, 200, JSON.stringify(retried.body));
+      assert.equal(retried.body.data.status, "QUEUED");
+      const ready = await waitStatus(ownerToken, ownerShop, intakeId, "DRAFT_READY");
+      assert.equal(ready.body.data.items[0].name, "Parle-G Biscuits");
+    } finally {
+      delete process.env.AI_INTAKE_PROCESSING_TIMEOUT_MINUTES;
+      provider.release();
+    }
+
+    const limitedId = await prepare(ownerToken, ownerShop, "fail-once.jpg");
+    process.env.AI_MAX_RETRIES = "0";
+    try {
+      const queued = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${limitedId}/process`);
+      assert.equal(queued.status, 200, JSON.stringify(queued.body));
+      const failed = await waitStatus(ownerToken, ownerShop, limitedId, "FAILED");
+      assert.equal(failed.body.data.canRetry, false);
+      const limited = await authed(ownerToken, ownerShop).post(`/api/v1/ai/intake/${limitedId}/retry`);
+      assert.equal(limited.status, 409, JSON.stringify(limited.body));
+      assert.equal(limited.body.error.code, "AI_INTAKE_RETRY_LIMIT");
+    } finally {
+      delete process.env.AI_MAX_RETRIES;
+    }
+  });
+
+  it("deletes abandoned media after the retention window and keeps an open draft", async () => {
+    const openId = await prepare(ownerToken, ownerShop, "keep.jpg");
+    await analyzed(ownerToken, ownerShop, openId);
+    const abandonedId = await prepare(ownerToken, ownerShop, "drop.jpg");
+    const abandoned = await authed(ownerToken, ownerShop).get(`/api/v1/ai/intake/${abandonedId}`);
+    const abandonedKey = abandoned.body.data.media.objectKey as string;
+    process.env.AI_INTAKE_MEDIA_RETENTION_DAYS = "0";
+    try {
+      const removed = await intake.cleanupExpiredMedia({
+        tenantId: shopId,
+        userId: ownerUserId,
+        role: "OWNER",
+      });
+      assert.equal(removed > 0, true);
+      assert.equal(await storage.exists(abandonedKey), false);
+      const open = await authed(ownerToken, ownerShop).get(`/api/v1/ai/intake/${openId}`);
+      assert.equal(open.body.data.status, "DRAFT_READY");
+      assert.equal(await storage.exists(open.body.data.media.objectKey as string), true);
+    } finally {
+      delete process.env.AI_INTAKE_MEDIA_RETENTION_DAYS;
     }
   });
 
@@ -661,13 +774,47 @@ describe("ai intake", () => {
     return response.body.data.id as string;
   }
 
-  async function prepare(token: string, shop: string, fileName: string): Promise<string> {
+  async function prepare(
+    token: string,
+    shop: string,
+    fileName: string,
+    contentType = "image/jpeg",
+  ): Promise<string> {
     const intakeId = await createIntake(token, shop);
+    const size = 64;
     const uploaded = await authed(token, shop)
       .post(`/api/v1/ai/intake/${intakeId}/upload-url`)
-      .send({ fileName, contentType: "image/jpeg", size: 1024 });
+      .send({ fileName, contentType, size });
     assert.equal(uploaded.status, 200, JSON.stringify(uploaded.body));
+    const objectKey = uploaded.body.data.objectKey as string;
+    assert.match(objectKey, new RegExp(`^tenants/.+/ai-intake/${intakeId}/`));
+    await storage.put(objectKey, { contentType, bytes: imageSignatureSample(contentType, size) });
     return intakeId;
+  }
+
+  async function analyzed(token: string, shop: string, intakeId: string): Promise<Response> {
+    const queued = await authed(token, shop).post(`/api/v1/ai/intake/${intakeId}/process`);
+    assert.equal(queued.status, 200, JSON.stringify(queued.body));
+    assert.equal(queued.body.data.status, "QUEUED");
+    return waitStatus(token, shop, intakeId, "DRAFT_READY");
+  }
+
+  async function waitStatus(token: string, shop: string, intakeId: string, status: string): Promise<Response> {
+    const deadline = Date.now() + 8_000;
+    let latest: Response | undefined;
+    while (Date.now() < deadline) {
+      latest = await authed(token, shop).get(`/api/v1/ai/intake/${intakeId}`);
+      assert.equal(latest.status, 200, JSON.stringify(latest.body));
+      const current = latest.body.data.status as string;
+      if (current === status) {
+        return latest;
+      }
+      if ((current === "FAILED" && status !== "FAILED") || (current === "DRAFT_READY" && status === "FAILED")) {
+        assert.fail(JSON.stringify(latest.body));
+      }
+      await delay(25);
+    }
+    assert.fail(`intake status stayed ${String(latest?.body?.data?.status)}`);
   }
 
   async function createProduct(
@@ -729,6 +876,12 @@ describe("ai intake", () => {
     return `${row.prefix}${String(row.next_number).padStart(row.pad_width, "0")}`;
   }
 });
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 function nextNational(): string {
   serial += 1;

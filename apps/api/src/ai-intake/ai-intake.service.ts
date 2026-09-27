@@ -13,25 +13,39 @@ import { InventoryService } from "../inventory/inventory.service";
 import { digest, normalizeKey } from "../payments/settlement-support";
 import { PurchaseService } from "../purchases/purchase.service";
 import { IntakeActor } from "./ai-intake.access";
+import { AiIntakeRateLimiter } from "./ai-intake-rate-limiter";
+import { AiIntakeQueue, IntakeJob } from "./ai-intake.queue";
 import {
+  AI_CLIENT_FAILURE,
   AI_PRODUCT_INTAKE_PROVIDER,
   AiAnalysisError,
   AiDetectedItem,
   AiProductIntakeProvider,
+  AiProviderFailureCode,
 } from "./ai-product-intake.provider";
+import { validateProviderPayload } from "./ai-output";
 import { ConfirmIntakeDto, CreateIntakeDto, UpdateIntakeItemDto, UploadUrlDto } from "./dto/ai-intake.dto";
+import { displayStatus, idleJob, IntakeJobState, isStale, readJob } from "./intake-job";
 import { matchCandidate, ProductMatch } from "./intake-match";
-import { assertUpload, intakeObjectKey, PENDING_MEDIA } from "./intake-media";
-import { intakeSettings } from "./intake-settings";
-import { OBJECT_STORAGE, ObjectStorage, PresignedUpload } from "./object-storage";
+import { assertStoredObject, assertTenantObjectKey, assertUpload, intakeObjectKey, PENDING_MEDIA } from "./intake-media";
+import { intakeSettings, retryDelayMs } from "./intake-settings";
+import { OBJECT_STORAGE, ObjectStorage, PresignedDownload, PresignedUpload } from "./object-storage";
 
-const SAFE_ANALYSIS_FAILURE = "The image could not be read.";
+const COUNTABLE_ACTIONS = ["ai_intake.processed", "ai_intake.processing_failed"] as const;
 
 interface UploadMeta {
   fileName: string;
   contentType: string;
   size: number;
   objectKey: string;
+  verified: boolean;
+  deletedAt: string | null;
+}
+
+interface ClaimedIntake {
+  generation: number;
+  attempts: number;
+  upload: UploadMeta;
 }
 
 interface EditedFields {
@@ -99,6 +113,8 @@ export interface IntakeSessionView {
   failureReason: string | null;
   createdAt: string;
   completedAt: string | null;
+  processingAttempts: number;
+  canRetry: boolean;
   media: UploadMeta | null;
   items: IntakeItemView[];
 }
@@ -141,6 +157,8 @@ export class AiIntakeService {
     private readonly logger: AppLogger,
     @Inject(AI_PRODUCT_INTAKE_PROVIDER) private readonly provider: AiProductIntakeProvider,
     @Inject(OBJECT_STORAGE) private readonly storage: ObjectStorage,
+    private readonly queue: AiIntakeQueue,
+    private readonly limiter: AiIntakeRateLimiter,
   ) {}
 
   async create(actor: IntakeActor, input: CreateIntakeDto): Promise<{ id: string; status: string; createdAt: string }> {
@@ -188,7 +206,7 @@ export class AiIntakeService {
     assertUuid(intakeId);
     const settings = intakeSettings();
     const checked = assertUpload(input.fileName, input.contentType, input.size, settings.maxBytes);
-    const objectKey = intakeObjectKey(actor.tenantId, intakeId, input.fileName);
+    const objectKey = intakeObjectKey(actor.tenantId, intakeId, checked.extension);
     await this.transactions.run(actor, async (tx) => {
       const session = await this.lockSession(tx, actor.tenantId, intakeId);
       if (session.status !== AiIntakeStatus.UPLOADED && session.status !== AiIntakeStatus.FAILED) {
@@ -204,6 +222,8 @@ export class AiIntakeService {
         contentType: checked.contentType,
         size: input.size,
         objectKey,
+        verified: false,
+        deletedAt: null,
       };
       await tx.aiIntakeSession.update({
         where: { id: intakeId },
@@ -213,7 +233,7 @@ export class AiIntakeService {
           status: AiIntakeStatus.UPLOADED,
           failureReason: null,
           completedAt: null,
-          rawOutput: { upload: { ...upload } } as Prisma.InputJsonObject,
+          rawOutput: sessionDocument(upload, idleJob()),
         },
       });
     });
@@ -226,121 +246,195 @@ export class AiIntakeService {
     return { ...signed, objectKey };
   }
 
-  async process(actor: IntakeActor, intakeId: string): Promise<IntakeSessionView> {
+  async process(actor: IntakeActor, intakeId: string, ip?: string): Promise<IntakeSessionView> {
+    return this.queueIntake(actor, intakeId, ip, false);
+  }
+
+  async retry(actor: IntakeActor, intakeId: string, ip?: string): Promise<IntakeSessionView> {
+    return this.queueIntake(actor, intakeId, ip, true);
+  }
+
+  async mediaUrl(actor: IntakeActor, intakeId: string): Promise<PresignedDownload> {
     assertUuid(intakeId);
-    const settings = intakeSettings();
-    const media = await this.transactions.run(actor, async (tx) => {
+    const upload = await this.transactions.run(actor, async (tx) => {
       const session = await this.lockSession(tx, actor.tenantId, intakeId);
-      if (session.status === AiIntakeStatus.PROCESSING) {
+      const stored = readUpload(session.rawOutput);
+      if (!stored || stored.deletedAt || session.mediaReference === PENDING_MEDIA) {
         throw new AppException(
-          ErrorCode.CONFLICT,
-          "This intake is already being processed.",
-          HttpStatus.CONFLICT,
+          ErrorCode.AI_INTAKE_MEDIA_NOT_FOUND,
+          "The image is no longer available.",
+          HttpStatus.NOT_FOUND,
         );
       }
-      if (session.status !== AiIntakeStatus.UPLOADED && session.status !== AiIntakeStatus.FAILED) {
-        throw new AppException(
-          ErrorCode.CONFLICT,
-          "This intake has already been processed.",
-          HttpStatus.CONFLICT,
-        );
-      }
-      const upload = readUpload(session.rawOutput);
-      if (!upload || session.mediaReference === PENDING_MEDIA) {
-        throw new AppException(
-          ErrorCode.CONFLICT,
-          "Upload an image before processing.",
-          HttpStatus.CONFLICT,
-        );
-      }
-      if (!(await this.storage.exists(upload.objectKey))) {
-        throw new AppException(
-          ErrorCode.CONFLICT,
-          "Upload an image before processing.",
-          HttpStatus.CONFLICT,
-        );
-      }
-      await tx.aiIntakeSession.update({
-        where: { id: intakeId },
-        data: { status: AiIntakeStatus.PROCESSING, failureReason: null, completedAt: null },
-      });
-      return upload;
+      assertTenantObjectKey(actor.tenantId, intakeId, stored.objectKey);
+      return stored;
     });
-    this.logger.write({
-      level: "info",
-      message: "ai_intake_processing_started",
-      module: "ai-intake",
-      operation: intakeId,
-    });
-
-    let analysisItems: AiDetectedItem[];
-    try {
-      const analysis = await withTimeout(
-        this.provider.analyze({ mediaType: media.contentType, objectKey: media.objectKey }),
-        settings.providerTimeoutMs,
+    const head = await this.storage.headObject(upload.objectKey);
+    if (!head) {
+      throw new AppException(
+        ErrorCode.AI_INTAKE_MEDIA_NOT_FOUND,
+        "The image is no longer available.",
+        HttpStatus.NOT_FOUND,
       );
-      analysisItems = analysis.items;
-    } catch (error) {
-      const message = safeFailure(error);
-      await this.failProcessing(actor, intakeId, message);
-      throw new AppException(ErrorCode.AI_INTAKE_FAILED, message, HttpStatus.UNPROCESSABLE_ENTITY);
     }
-
-    try {
-      return await this.transactions.run(actor, async (tx) => {
-        const session = await this.lockSession(tx, actor.tenantId, intakeId);
-        if (session.status !== AiIntakeStatus.PROCESSING) {
-          throw new AppException(
-            ErrorCode.CONFLICT,
-            "This intake is already being processed.",
-            HttpStatus.CONFLICT,
-          );
-        }
-        await tx.aiIntakeItem.deleteMany({ where: { tenantId: actor.tenantId, sessionId: intakeId } });
-        await this.insertDrafts(tx, actor, intakeId, analysisItems, settings.confidenceThreshold);
-        const upload = readUpload(session.rawOutput);
-        await tx.aiIntakeSession.update({
-          where: { id: intakeId },
-          data: {
-            status: AiIntakeStatus.DRAFT_READY,
-            failureReason: null,
-            completedAt: new Date(),
-            rawOutput: {
-              upload: upload ?? undefined,
-              itemCount: analysisItems.length,
-            } as Prisma.InputJsonObject,
-          },
-        });
-        await this.audit.write(tx, {
-          action: "ai_intake.processed",
-          entityType: "ai_intake_session",
-          entityId: intakeId,
-          tenantId: actor.tenantId,
-          actorUserId: actor.userId,
-          metadata: { status: "DRAFT_READY", itemCount: analysisItems.length },
-        });
-        const view = await this.loadView(tx, actor.tenantId, intakeId);
-        this.logger.write({
-          level: "info",
-          message: "ai_intake_processing_completed",
-          module: "ai-intake",
-          operation: intakeId,
-        });
-        return view;
-      });
-    } catch (error) {
-      if (error instanceof AppException) {
-        throw error;
-      }
-      const message = safeFailure(error);
-      await this.failProcessing(actor, intakeId, message);
-      throw new AppException(ErrorCode.AI_INTAKE_FAILED, message, HttpStatus.UNPROCESSABLE_ENTITY);
-    }
+    return this.storage.createDownloadUrl({
+      objectKey: upload.objectKey,
+      expiresInSeconds: intakeSettings().downloadUrlTtlSeconds,
+    });
   }
 
   async get(actor: IntakeActor, intakeId: string): Promise<IntakeSessionView> {
     assertUuid(intakeId);
-    return this.transactions.run(actor, (tx) => this.loadView(tx, actor.tenantId, intakeId));
+    await this.cleanupExpiredMedia(actor, intakeId);
+    return this.transactions.run(actor, async (tx) => {
+      const session = await this.lockSession(tx, actor.tenantId, intakeId);
+      await this.markStale(tx, actor, session);
+      return this.loadView(tx, actor.tenantId, intakeId);
+    });
+  }
+
+  /**
+   * Shop-scoped media cleanup. Row security hides other shops, so this does
+   * not scan the whole database. Active review and in-flight jobs are kept.
+   */
+  async cleanupExpiredMedia(actor: IntakeActor, exceptId?: string): Promise<number> {
+    const cutoff = new Date(Date.now() - intakeSettings().mediaRetentionDays * 24 * 60 * 60 * 1000);
+    const candidates = await this.transactions.run(actor, async (tx) => {
+      const rows = await tx.aiIntakeSession.findMany({
+        where: {
+          tenantId: actor.tenantId,
+          status: { in: [AiIntakeStatus.UPLOADED, AiIntakeStatus.FAILED, AiIntakeStatus.CONFIRMED] },
+          createdAt: { lt: cutoff },
+          ...(exceptId ? { id: { not: exceptId } } : {}),
+        },
+        select: { id: true, rawOutput: true, mediaReference: true },
+        take: 20,
+      });
+      return rows.flatMap((row) => {
+        const upload = readUpload(row.rawOutput);
+        const job = readJob(row.rawOutput);
+        if (!upload || upload.deletedAt || row.mediaReference === PENDING_MEDIA) {
+          return [];
+        }
+        if (job.state === "QUEUED" || job.state === "PROCESSING") {
+          return [];
+        }
+        return [{ id: row.id, objectKey: upload.objectKey }];
+      });
+    });
+    let removed = 0;
+    for (const row of candidates) {
+      await this.storage.deleteObject(row.objectKey);
+      await this.transactions.run(actor, async (tx) => {
+        const session = await this.lockSession(tx, actor.tenantId, row.id);
+        const upload = readUpload(session.rawOutput);
+        const job = readJob(session.rawOutput);
+        if (!upload || upload.objectKey !== row.objectKey || upload.deletedAt) {
+          return;
+        }
+        if (job.state === "QUEUED" || job.state === "PROCESSING") {
+          return;
+        }
+        await tx.aiIntakeSession.update({
+          where: { id: row.id },
+          data: { rawOutput: sessionDocument({ ...upload, deletedAt: new Date().toISOString() }, job) },
+        });
+        await this.audit.write(tx, {
+          action: "ai_intake.media_deleted",
+          entityType: "ai_intake_session",
+          entityId: row.id,
+          tenantId: actor.tenantId,
+          actorUserId: actor.userId,
+        });
+      });
+      removed += 1;
+    }
+    return removed;
+  }
+
+  /** Worker entry. A wrong shop cannot see the intake and leaves it unchanged. */
+  async runJob(job: IntakeJob): Promise<void> {
+    const actor: IntakeActor = { tenantId: job.tenantId, userId: job.userId, role: job.role };
+    let claimed: ClaimedIntake | null;
+    try {
+      claimed = await this.claimProcessing(actor, job.intakeId);
+    } catch (error) {
+      if (!(error instanceof AppException) || error.code !== ErrorCode.AI_INTAKE_NOT_FOUND) {
+        this.logEvent("warn", "ai_intake_processing_failed", {
+          intakeId: job.intakeId,
+          errorCode: "AI_PROVIDER_UNKNOWN",
+          attempt: 0,
+        });
+      }
+      return;
+    }
+    if (!claimed) {
+      return;
+    }
+    const settings = intakeSettings();
+    const started = Date.now();
+    this.logEvent("info", "ai_intake_processing_started", {
+      intakeId: job.intakeId,
+      provider: this.provider.name,
+      model: this.provider.model,
+      mediaType: claimed.upload.contentType,
+      fileSize: claimed.upload.size,
+      attempt: claimed.attempts,
+    });
+    try {
+      await this.assertMedia(actor, job.intakeId, claimed.upload);
+      const download = await this.storage.createDownloadUrl({
+        objectKey: claimed.upload.objectKey,
+        expiresInSeconds: settings.downloadUrlTtlSeconds,
+      });
+      const analysis = await withTimeout(
+        this.provider.analyze({
+          mediaType: claimed.upload.contentType,
+          mimeType: claimed.upload.contentType,
+          objectKey: claimed.upload.objectKey,
+          fileName: claimed.upload.fileName,
+          downloadUrl: download.url,
+        }),
+        settings.providerTimeoutMs,
+      );
+      const items = validateProviderPayload({ items: analysis.items });
+      const saved = await this.finishJob(actor, job.intakeId, claimed.generation, items, settings.confidenceThreshold);
+      if (!saved) {
+        return;
+      }
+      this.logEvent(
+        "info",
+        "ai_intake_processing_completed",
+        {
+          intakeId: job.intakeId,
+          provider: this.provider.name,
+          model: this.provider.model,
+          mediaType: claimed.upload.contentType,
+          fileSize: claimed.upload.size,
+          attempt: claimed.attempts,
+          itemCount: items.length,
+          inputTokens: analysis.usage?.inputTokens ?? null,
+          outputTokens: analysis.usage?.outputTokens ?? null,
+        },
+        Date.now() - started,
+      );
+    } catch (error) {
+      const failure = classifyFailure(error);
+      this.logEvent(
+        "warn",
+        "ai_intake_processing_failed",
+        { intakeId: job.intakeId, errorCode: failure.code, attempt: claimed.attempts },
+        Date.now() - started,
+      );
+      if (failure.retryable && claimed.attempts <= settings.maxRetries) {
+        const requeued = await this.requeueJob(actor, job.intakeId, claimed.generation, failure.code);
+        if (requeued) {
+          this.queue.enqueue(job, retryDelayMs(claimed.attempts));
+          return;
+        }
+      }
+      await this.failJob(actor, job.intakeId, claimed.generation, failure);
+    }
   }
 
   async updateItem(
@@ -725,6 +819,350 @@ export class AiIntakeService {
     return category?.id ?? null;
   }
 
+  private async queueIntake(
+    actor: IntakeActor,
+    intakeId: string,
+    ip: string | undefined,
+    retryOnly: boolean,
+  ): Promise<IntakeSessionView> {
+    assertUuid(intakeId);
+    const settings = intakeSettings();
+    this.limiter.assertAllowed({ tenantId: actor.tenantId, userId: actor.userId, ip }, settings.maxPerMinute);
+    await this.cleanupExpiredMedia(actor, intakeId);
+    const prepared = await this.transactions.run(actor, async (tx) => {
+      const session = await this.lockSession(tx, actor.tenantId, intakeId);
+      await this.markStale(tx, actor, session);
+      const current = await this.lockSession(tx, actor.tenantId, intakeId);
+      this.assertQueueable(current.status, readJob(current.rawOutput), retryOnly, settings.maxRetries);
+      const upload = readUpload(current.rawOutput);
+      if (!upload || current.mediaReference === PENDING_MEDIA) {
+        throw new AppException(ErrorCode.CONFLICT, "Upload an image before processing.", HttpStatus.CONFLICT);
+      }
+      if (upload.deletedAt) {
+        throw new AppException(
+          ErrorCode.AI_INTAKE_MEDIA_NOT_FOUND,
+          "The image is no longer available.",
+          HttpStatus.NOT_FOUND,
+        );
+      }
+      return { upload, wasFailed: current.status === AiIntakeStatus.FAILED, verified: upload.verified };
+    });
+    await this.assertMedia(actor, intakeId, prepared.upload);
+    const view = await this.transactions.run(actor, async (tx) => {
+      const session = await this.lockSession(tx, actor.tenantId, intakeId);
+      const job = readJob(session.rawOutput);
+      if (
+        session.status === AiIntakeStatus.PROCESSING ||
+        (session.status === AiIntakeStatus.UPLOADED && job.state === "QUEUED")
+      ) {
+        throw new AppException(ErrorCode.CONFLICT, "This intake is already being processed.", HttpStatus.CONFLICT);
+      }
+      this.assertQueueable(session.status, job, retryOnly, settings.maxRetries);
+      const upload = readUpload(session.rawOutput);
+      if (!upload || upload.objectKey !== prepared.upload.objectKey || upload.deletedAt) {
+        throw new AppException(ErrorCode.AI_INTAKE_UPLOAD_NOT_VERIFIED, "Upload the image before processing.", HttpStatus.CONFLICT);
+      }
+      await this.assertDailyCap(tx, actor, settings.maxDailyProcesses);
+      const next: IntakeJobState = {
+        state: "QUEUED",
+        generation: job.generation + 1,
+        attempts: job.attempts,
+        queuedAt: new Date().toISOString(),
+        processingStartedAt: null,
+        errorCode: null,
+        retryable: false,
+      };
+      const verified: UploadMeta = { ...upload, verified: true };
+      await tx.aiIntakeItem.deleteMany({ where: { tenantId: actor.tenantId, sessionId: intakeId } });
+      await tx.aiIntakeSession.update({
+        where: { id: intakeId },
+        data: {
+          status: AiIntakeStatus.UPLOADED,
+          mediaReference: verified.objectKey,
+          failureReason: null,
+          completedAt: null,
+          rawOutput: sessionDocument(verified, next),
+        },
+      });
+      if (!prepared.verified) {
+        await this.audit.write(tx, {
+          action: "ai_intake.media_uploaded",
+          entityType: "ai_intake_session",
+          entityId: intakeId,
+          tenantId: actor.tenantId,
+          actorUserId: actor.userId,
+        });
+      }
+      if (prepared.wasFailed) {
+        await this.audit.write(tx, {
+          action: "ai_intake.processing_retried",
+          entityType: "ai_intake_session",
+          entityId: intakeId,
+          tenantId: actor.tenantId,
+          actorUserId: actor.userId,
+          metadata: { attempt: job.attempts },
+        });
+      }
+      return this.loadView(tx, actor.tenantId, intakeId);
+    });
+    this.queue.enqueue({ tenantId: actor.tenantId, userId: actor.userId, role: actor.role, intakeId });
+    return view;
+  }
+
+  private assertQueueable(status: AiIntakeStatus, job: IntakeJobState, retryOnly: boolean, maxRetries: number): void {
+    if (status === AiIntakeStatus.PROCESSING || (status === AiIntakeStatus.UPLOADED && job.state === "QUEUED")) {
+      throw new AppException(ErrorCode.CONFLICT, "This intake is already being processed.", HttpStatus.CONFLICT);
+    }
+    if (retryOnly && status !== AiIntakeStatus.FAILED) {
+      throw new AppException(ErrorCode.AI_INTAKE_NOT_RETRYABLE, "This intake cannot be retried.", HttpStatus.CONFLICT);
+    }
+    if (!retryOnly && status !== AiIntakeStatus.UPLOADED && status !== AiIntakeStatus.FAILED) {
+      throw new AppException(ErrorCode.CONFLICT, "This intake has already been processed.", HttpStatus.CONFLICT);
+    }
+    if (status === AiIntakeStatus.FAILED) {
+      if (!job.retryable) {
+        throw new AppException(ErrorCode.AI_INTAKE_NOT_RETRYABLE, "This intake cannot be retried.", HttpStatus.CONFLICT);
+      }
+      if (job.attempts > maxRetries) {
+        throw new AppException(
+          ErrorCode.AI_INTAKE_RETRY_LIMIT,
+          "This intake has been retried too many times.",
+          HttpStatus.CONFLICT,
+        );
+      }
+    }
+  }
+
+  private async claimProcessing(actor: IntakeActor, intakeId: string): Promise<ClaimedIntake | null> {
+    return this.transactions.run(actor, async (tx) => {
+      const session = await this.lockSession(tx, actor.tenantId, intakeId);
+      const job = readJob(session.rawOutput);
+      const upload = readUpload(session.rawOutput);
+      if (session.status !== AiIntakeStatus.UPLOADED || job.state !== "QUEUED" || !upload || upload.deletedAt) {
+        return null;
+      }
+      const next: IntakeJobState = {
+        state: "PROCESSING",
+        generation: job.generation,
+        attempts: job.attempts + 1,
+        queuedAt: job.queuedAt,
+        processingStartedAt: new Date().toISOString(),
+        errorCode: null,
+        retryable: false,
+      };
+      await tx.aiIntakeSession.update({
+        where: { id: intakeId },
+        data: {
+          status: AiIntakeStatus.PROCESSING,
+          failureReason: null,
+          completedAt: null,
+          rawOutput: sessionDocument(upload, next),
+        },
+      });
+      return { generation: job.generation, attempts: next.attempts, upload };
+    });
+  }
+
+  private async finishJob(
+    actor: IntakeActor,
+    intakeId: string,
+    generation: number,
+    items: AiDetectedItem[],
+    threshold: number,
+  ): Promise<boolean> {
+    return this.transactions.run(actor, async (tx) => {
+      const session = await this.lockSession(tx, actor.tenantId, intakeId);
+      const job = readJob(session.rawOutput);
+      if (session.status !== AiIntakeStatus.PROCESSING || job.generation !== generation) {
+        return false;
+      }
+      await tx.aiIntakeItem.deleteMany({ where: { tenantId: actor.tenantId, sessionId: intakeId } });
+      await this.insertDrafts(tx, actor, intakeId, items, threshold);
+      const upload = readUpload(session.rawOutput);
+      await tx.aiIntakeSession.update({
+        where: { id: intakeId },
+        data: {
+          status: AiIntakeStatus.DRAFT_READY,
+          failureReason: null,
+          completedAt: new Date(),
+          rawOutput: sessionDocument(upload, { ...job, state: "IDLE", errorCode: null, retryable: false }, { itemCount: items.length }),
+        },
+      });
+      await this.audit.write(tx, {
+        action: "ai_intake.processed",
+        entityType: "ai_intake_session",
+        entityId: intakeId,
+        tenantId: actor.tenantId,
+        actorUserId: actor.userId,
+        metadata: { status: "DRAFT_READY", itemCount: items.length },
+      });
+      return true;
+    });
+  }
+
+  private async requeueJob(
+    actor: IntakeActor,
+    intakeId: string,
+    generation: number,
+    errorCode: string,
+  ): Promise<boolean> {
+    return this.transactions.run(actor, async (tx) => {
+      const session = await this.lockSession(tx, actor.tenantId, intakeId);
+      const job = readJob(session.rawOutput);
+      if (session.status !== AiIntakeStatus.PROCESSING || job.generation !== generation) {
+        return false;
+      }
+      const upload = readUpload(session.rawOutput);
+      await tx.aiIntakeSession.update({
+        where: { id: intakeId },
+        data: {
+          status: AiIntakeStatus.UPLOADED,
+          failureReason: null,
+          completedAt: null,
+          rawOutput: sessionDocument(upload, {
+            ...job,
+            state: "QUEUED",
+            queuedAt: new Date().toISOString(),
+            processingStartedAt: null,
+            errorCode,
+            retryable: true,
+          }),
+        },
+      });
+      await this.audit.write(tx, {
+        action: "ai_intake.processing_retried",
+        entityType: "ai_intake_session",
+        entityId: intakeId,
+        tenantId: actor.tenantId,
+        actorUserId: actor.userId,
+        metadata: { attempt: job.attempts, errorCode },
+      });
+      return true;
+    });
+  }
+
+  private async failJob(
+    actor: IntakeActor,
+    intakeId: string,
+    generation: number,
+    failure: { code: string; retryable: boolean },
+  ): Promise<void> {
+    await this.transactions.run(actor, async (tx) => {
+      const session = await this.lockSession(tx, actor.tenantId, intakeId);
+      const job = readJob(session.rawOutput);
+      if (session.status !== AiIntakeStatus.PROCESSING || job.generation !== generation) {
+        return;
+      }
+      await tx.aiIntakeItem.deleteMany({ where: { tenantId: actor.tenantId, sessionId: intakeId } });
+      const upload = readUpload(session.rawOutput);
+      await tx.aiIntakeSession.update({
+        where: { id: intakeId },
+        data: {
+          status: AiIntakeStatus.FAILED,
+          failureReason: AI_CLIENT_FAILURE,
+          completedAt: new Date(),
+          rawOutput: sessionDocument(upload, { ...job, state: "IDLE", errorCode: failure.code, retryable: failure.retryable }),
+        },
+      });
+      await this.audit.write(tx, {
+        action: "ai_intake.processing_failed",
+        entityType: "ai_intake_session",
+        entityId: intakeId,
+        tenantId: actor.tenantId,
+        actorUserId: actor.userId,
+        metadata: { errorCode: failure.code },
+      });
+    });
+  }
+
+  private async markStale(
+    tx: ShopDb,
+    actor: IntakeActor,
+    session: { id: string; status: AiIntakeStatus; rawOutput: Prisma.JsonValue | null },
+  ): Promise<void> {
+    const job = readJob(session.rawOutput);
+    const settings = intakeSettings();
+    const processing = session.status === AiIntakeStatus.PROCESSING && isStale(job, settings.processingTimeoutMinutes);
+    const queued =
+      session.status === AiIntakeStatus.UPLOADED && job.state === "QUEUED" && isStale(job, settings.processingTimeoutMinutes);
+    if (!processing && !queued) {
+      return;
+    }
+    const upload = readUpload(session.rawOutput);
+    await tx.aiIntakeSession.update({
+      where: { id: session.id },
+      data: {
+        status: AiIntakeStatus.FAILED,
+        failureReason: AI_CLIENT_FAILURE,
+        completedAt: new Date(),
+        rawOutput: sessionDocument(upload, {
+          ...job,
+          state: "IDLE",
+          errorCode: "AI_PROVIDER_TIMEOUT",
+          retryable: job.attempts <= settings.maxRetries,
+        }),
+      },
+    });
+    await this.audit.write(tx, {
+      action: "ai_intake.processing_failed",
+      entityType: "ai_intake_session",
+      entityId: session.id,
+      tenantId: actor.tenantId,
+      actorUserId: actor.userId,
+      metadata: { stale: true },
+    });
+  }
+
+  private async assertMedia(actor: IntakeActor, intakeId: string, upload: UploadMeta): Promise<void> {
+    const settings = intakeSettings();
+    const head = await this.storage.headObject(upload.objectKey);
+    const header = head ? await this.storage.readHeader(upload.objectKey, 32) : null;
+    assertStoredObject({
+      tenantId: actor.tenantId,
+      intakeId,
+      objectKey: upload.objectKey,
+      declaredType: upload.contentType,
+      declaredSize: upload.size,
+      head,
+      header,
+      maxBytes: settings.maxBytes,
+    });
+  }
+
+  private async assertDailyCap(tx: ShopDb, actor: IntakeActor, max: number): Promise<void> {
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const where = {
+      action: { in: [...COUNTABLE_ACTIONS] },
+      occurredAt: { gte: since },
+    };
+    const [shop, user] = await Promise.all([
+      tx.auditLog.count({ where: { tenantId: actor.tenantId, ...where } }),
+      tx.auditLog.count({ where: { tenantId: actor.tenantId, actorUserId: actor.userId, ...where } }),
+    ]);
+    if (shop >= max || user >= max) {
+      throw new AppException(
+        ErrorCode.AI_INTAKE_RATE_LIMITED,
+        "Too many intake requests. Try again shortly.",
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
+  }
+
+  private logEvent(
+    level: "info" | "warn",
+    event: string,
+    fields: Record<string, string | number | null>,
+    durationMs?: number,
+  ): void {
+    this.logger.write({
+      level,
+      message: JSON.stringify({ event, ...fields }),
+      module: "ai-intake",
+      operation: typeof fields.intakeId === "string" ? fields.intakeId : event,
+      durationMs,
+    });
+  }
+
   private async insertDrafts(
     tx: ShopDb,
     actor: IntakeActor,
@@ -733,41 +1171,47 @@ export class AiIntakeService {
     threshold: number,
   ): Promise<void> {
     if (items.length > 50) {
-      throw new AiAnalysisError(SAFE_ANALYSIS_FAILURE);
+      throw new AiAnalysisError(AI_CLIENT_FAILURE, { code: "AI_PROVIDER_INVALID_RESPONSE", retryable: false });
     }
     let position = 0;
     for (const item of items) {
       const name = normalizeName(item.name ?? "");
-      if (name.length === 0 || name.length > 200) {
-        throw new AiAnalysisError(SAFE_ANALYSIS_FAILURE);
+      if (name.length > 200) {
+        throw new AiAnalysisError(AI_CLIENT_FAILURE, { code: "AI_PROVIDER_INVALID_RESPONSE", retryable: false });
       }
       const confidence = confidenceDecimal(item.confidence);
       const barcode = item.barcode ? normalizeBarcode(item.barcode) : null;
       if (barcode && barcode.length > 64) {
-        throw new AiAnalysisError(SAFE_ANALYSIS_FAILURE);
+        throw new AiAnalysisError(AI_CLIENT_FAILURE, { code: "AI_PROVIDER_INVALID_RESPONSE", retryable: false });
       }
       const sku = item.sku ? normalizeSku(item.sku) : null;
       if (sku && sku.length > 64) {
-        throw new AiAnalysisError(SAFE_ANALYSIS_FAILURE);
+        throw new AiAnalysisError(AI_CLIENT_FAILURE, { code: "AI_PROVIDER_INVALID_RESPONSE", retryable: false });
       }
-      const match = await matchCandidate(
-        tx,
-        actor.tenantId,
-        { name, barcode, sku, confidence: item.confidence },
-        threshold,
-      );
+      const match =
+        name.length > 0
+          ? await matchCandidate(tx, actor.tenantId, { name, barcode, sku, confidence: item.confidence }, threshold)
+          : {
+              matchType: "NEW_PRODUCT" as const,
+              matchedProductId: null,
+              possibleProductId: null,
+              needsReview: true,
+            };
       await tx.aiIntakeItem.create({
         data: {
           tenantId: actor.tenantId,
           sessionId,
           position,
-          detectedName: name,
-          suggestedBrandName: bounded(item.brand, 120),
-          suggestedCategoryName: bounded(item.category, 120),
+          detectedName: name.length > 0 ? name : null,
+          detectedNameEn: bounded(item.nameEn ?? undefined, 200),
+          detectedNameHi: bounded(item.nameHi ?? undefined, 200),
+          detectedNameMr: bounded(item.nameMr ?? undefined, 200),
+          suggestedBrandName: bounded(item.brand ?? undefined, 120),
+          suggestedCategoryName: bounded(item.category ?? undefined, 120),
           suggestedBarcode: barcode,
-          suggestedQuantity: optionalProviderStock(item.quantity),
-          suggestedPurchasePrice: optionalProviderMoney(item.purchasePrice),
-          suggestedSellingPrice: optionalProviderMoney(item.sellingPrice),
+          suggestedQuantity: optionalProviderStock(item.quantity ?? undefined),
+          suggestedPurchasePrice: optionalProviderMoney(item.purchasePrice ?? undefined),
+          suggestedSellingPrice: optionalProviderMoney(item.sellingPrice ?? undefined),
           confidence,
           status: AiItemStatus.PENDING,
           matchedProductId: match.matchedProductId,
@@ -777,43 +1221,12 @@ export class AiIntakeService {
             possibleProductId: match.possibleProductId,
             suggestedSku: sku,
             suggestedUnit: item.unit ? normalizeName(item.unit).slice(0, 80) : null,
+            ...(item.evidence ? { evidence: evidenceJson(item.evidence) } : {}),
           } satisfies Prisma.InputJsonObject,
         },
       });
       position += 1;
     }
-  }
-
-  private async failProcessing(actor: IntakeActor, intakeId: string, message: string): Promise<void> {
-    await this.transactions.run(actor, async (tx) => {
-      const session = await this.lockSession(tx, actor.tenantId, intakeId);
-      if (session.status !== AiIntakeStatus.PROCESSING) {
-        return;
-      }
-      await tx.aiIntakeItem.deleteMany({ where: { tenantId: actor.tenantId, sessionId: intakeId } });
-      await tx.aiIntakeSession.update({
-        where: { id: intakeId },
-        data: {
-          status: AiIntakeStatus.FAILED,
-          failureReason: message.slice(0, 500),
-          completedAt: new Date(),
-        },
-      });
-      await this.audit.write(tx, {
-        action: "ai_intake.processed",
-        entityType: "ai_intake_session",
-        entityId: intakeId,
-        tenantId: actor.tenantId,
-        actorUserId: actor.userId,
-        metadata: { status: "FAILED" },
-      });
-    });
-    this.logger.write({
-      level: "warn",
-      message: "ai_intake_processing_failed",
-      module: "ai-intake",
-      operation: intakeId,
-    });
   }
 
   private async loadView(tx: ShopDb, tenantId: string, intakeId: string): Promise<IntakeSessionView> {
@@ -836,13 +1249,21 @@ export class AiIntakeService {
     const rows = await this.itemRows(tx, tenantId, intakeId);
     const names = await this.productNames(tx, tenantId, rows);
     const upload = readUpload(session.rawOutput);
+    const job = readJob(session.rawOutput);
+    const settings = intakeSettings();
     return {
       id: session.id,
-      status: session.status,
+      status: displayStatus(session.status, job),
       sourceType: session.sourceType,
       failureReason: session.failureReason,
       createdAt: session.createdAt.toISOString(),
       completedAt: session.completedAt ? session.completedAt.toISOString() : null,
+      processingAttempts: job.attempts,
+      canRetry:
+        session.status === AiIntakeStatus.FAILED &&
+        job.retryable &&
+        job.attempts <= settings.maxRetries &&
+        !upload?.deletedAt,
       media: session.mediaReference === PENDING_MEDIA ? null : upload,
       items: rows.map((row) => presentItem(row, names)),
     };
@@ -1095,6 +1516,8 @@ function readUpload(raw: Prisma.JsonValue | null): UploadMeta | null {
     contentType: row.contentType,
     size: typeof row.size === "number" ? row.size : 0,
     objectKey: row.objectKey,
+    verified: row.verified === true,
+    deletedAt: typeof row.deletedAt === "string" ? row.deletedAt : null,
   };
 }
 
@@ -1151,7 +1574,7 @@ function optionalProviderStock(value: string | undefined): Prisma.Decimal | null
   try {
     return parseStock(value);
   } catch {
-    throw new AiAnalysisError(SAFE_ANALYSIS_FAILURE);
+    throw new AiAnalysisError(AI_CLIENT_FAILURE, { code: "AI_PROVIDER_INVALID_RESPONSE", retryable: false });
   }
 }
 
@@ -1162,13 +1585,13 @@ function optionalProviderMoney(value: string | undefined): Prisma.Decimal | null
   try {
     return parseMoney(value);
   } catch {
-    throw new AiAnalysisError(SAFE_ANALYSIS_FAILURE);
+    throw new AiAnalysisError(AI_CLIENT_FAILURE, { code: "AI_PROVIDER_INVALID_RESPONSE", retryable: false });
   }
 }
 
 function confidenceDecimal(value: number): Prisma.Decimal {
   if (!Number.isFinite(value) || value < 0 || value > 1) {
-    throw new AiAnalysisError(SAFE_ANALYSIS_FAILURE);
+    throw new AiAnalysisError(AI_CLIENT_FAILURE, { code: "AI_PROVIDER_INVALID_RESPONSE", retryable: false });
   }
   return new Prisma.Decimal(value.toFixed(4));
 }
@@ -1200,7 +1623,7 @@ function assertUuid(value: string): void {
 function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new AiAnalysisError("The image could not be read in time."));
+      reject(new AiAnalysisError(AI_CLIENT_FAILURE, { code: "AI_PROVIDER_TIMEOUT", retryable: true }));
     }, ms);
     work.then(
       (value) => {
@@ -1215,9 +1638,61 @@ function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-function safeFailure(error: unknown): string {
-  if (error instanceof AiAnalysisError && error.message.length > 0 && error.message.length <= 200) {
-    return error.message;
+function classifyFailure(error: unknown): { code: AiProviderFailureCode | string; retryable: boolean } {
+  if (error instanceof AiAnalysisError) {
+    return { code: error.code, retryable: error.retryable };
   }
-  return SAFE_ANALYSIS_FAILURE;
+  if (error instanceof AppException) {
+    return { code: error.code, retryable: false };
+  }
+  return { code: "AI_PROVIDER_UNKNOWN", retryable: true };
+}
+
+function sessionDocument(
+  upload: UploadMeta | null,
+  job: IntakeJobState,
+  extra?: Record<string, Prisma.InputJsonValue>,
+): Prisma.InputJsonObject {
+  const document: Record<string, Prisma.InputJsonValue> = {
+    job: {
+      state: job.state,
+      generation: job.generation,
+      attempts: job.attempts,
+      queuedAt: job.queuedAt,
+      processingStartedAt: job.processingStartedAt,
+      errorCode: job.errorCode,
+      retryable: job.retryable,
+    },
+  };
+  if (upload) {
+    document.upload = {
+      fileName: upload.fileName,
+      contentType: upload.contentType,
+      size: upload.size,
+      objectKey: upload.objectKey,
+      verified: upload.verified,
+      deletedAt: upload.deletedAt,
+    };
+  }
+  if (extra) {
+    Object.assign(document, extra);
+  }
+  return document;
+}
+
+function evidenceJson(evidence: NonNullable<AiDetectedItem["evidence"]>): Prisma.InputJsonObject {
+  const row: Record<string, boolean> = {};
+  if (evidence.barcodeVisible !== undefined) {
+    row.barcodeVisible = evidence.barcodeVisible;
+  }
+  if (evidence.labelVisible !== undefined) {
+    row.labelVisible = evidence.labelVisible;
+  }
+  if (evidence.priceVisible !== undefined) {
+    row.priceVisible = evidence.priceVisible;
+  }
+  if (evidence.quantityVisible !== undefined) {
+    row.quantityVisible = evidence.quantityVisible;
+  }
+  return row;
 }

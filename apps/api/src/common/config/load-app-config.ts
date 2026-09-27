@@ -7,6 +7,24 @@ export type NodeEnvironment = (typeof nodeEnvironments)[number];
 export type LogLevel = (typeof logLevels)[number];
 
 export type OtpProviderName = "console" | "capture" | "unconfigured";
+export type AiProviderName = "mock" | "openai";
+export type StorageProviderName = "mock" | "s3";
+
+export interface AiConfig {
+  provider: AiProviderName;
+  model: string;
+  apiKey: string;
+  baseUrl: string;
+}
+
+export interface StorageConfig {
+  provider: StorageProviderName;
+  bucket: string;
+  region: string;
+  endpoint: string;
+  accessKeyId: string;
+  secretAccessKey: string;
+}
 
 export interface AppConfig {
   nodeEnv: NodeEnvironment;
@@ -26,6 +44,8 @@ export interface AppConfig {
   otpRequestLimit: number;
   otpRequestWindowSeconds: number;
   otpIpLimit: number;
+  ai: AiConfig;
+  storage: StorageConfig;
 }
 
 const EnvSchema = z.object({
@@ -85,13 +105,18 @@ export function loadAppConfig(env: NodeJS.ProcessEnv): AppConfig {
     throw new Error("SESSION_SECRET and OTP_PEPPER must be different.");
   }
 
+  const corsOrigins = parseCorsOrigins(nodeEnv, parsed.data.CORS_ORIGINS);
+  const otpProvider = resolveOtpProvider(nodeEnv, parsed.data.OTP_PROVIDER);
+  const ai = resolveAi(nodeEnv, env);
+  const storage = resolveStorage(nodeEnv, env);
+
   return {
     nodeEnv,
     port,
     databaseUrl: parsed.data.DATABASE_URL,
     apiPrefix: parsed.data.API_PREFIX ?? "api",
     logLevel: parsed.data.LOG_LEVEL ?? "info",
-    corsOrigins: parseCorsOrigins(nodeEnv, parsed.data.CORS_ORIGINS),
+    corsOrigins,
     databaseAppRole,
     swaggerEnabled: nodeEnv !== "production",
     sessionTtlDays: boundedInt(parsed.data.SESSION_TTL_DAYS, 30, 1, 365, "SESSION_TTL_DAYS"),
@@ -99,7 +124,7 @@ export function loadAppConfig(env: NodeJS.ProcessEnv): AppConfig {
     otpPepper: parsed.data.OTP_PEPPER,
     otpTtlSeconds: boundedInt(parsed.data.OTP_TTL_SECONDS, 300, 30, 3600, "OTP_TTL_SECONDS"),
     otpMaxAttempts: boundedInt(parsed.data.OTP_MAX_ATTEMPTS, 5, 1, 10, "OTP_MAX_ATTEMPTS"),
-    otpProvider: resolveOtpProvider(nodeEnv, parsed.data.OTP_PROVIDER),
+    otpProvider,
     otpRequestLimit: boundedInt(parsed.data.OTP_REQUEST_LIMIT, 5, 1, 100, "OTP_REQUEST_LIMIT"),
     otpRequestWindowSeconds: boundedInt(
       parsed.data.OTP_REQUEST_WINDOW_SECONDS,
@@ -109,6 +134,8 @@ export function loadAppConfig(env: NodeJS.ProcessEnv): AppConfig {
       "OTP_REQUEST_WINDOW_SECONDS",
     ),
     otpIpLimit: boundedInt(parsed.data.OTP_IP_LIMIT, 30, 1, 1000, "OTP_IP_LIMIT"),
+    ai,
+    storage,
   };
 }
 
@@ -141,6 +168,67 @@ function boundedInt(
     throw new Error(`${name} is out of range.`);
   }
   return value;
+}
+
+function resolveAi(nodeEnv: NodeEnvironment, env: NodeJS.ProcessEnv): AiConfig {
+  const mock = { provider: "mock" as const, model: "", apiKey: "", baseUrl: "" };
+  if (nodeEnv === "test") {
+    return mock;
+  }
+  const raw = (env.AI_PROVIDER ?? "").trim().toLowerCase();
+  if (nodeEnv === "production") {
+    if (raw !== "openai") {
+      throw new Error("AI_PROVIDER must be openai in production.");
+    }
+  } else if (raw.length === 0 || raw === "mock") {
+    return mock;
+  }
+  if (raw !== "openai") {
+    throw new Error("AI_PROVIDER is invalid.");
+  }
+  const apiKey = env.AI_API_KEY?.trim() ?? "";
+  const model = env.AI_VISION_MODEL?.trim() ?? "";
+  const baseUrl = env.AI_API_BASE_URL?.trim() ?? "";
+  if (apiKey.length < 8 || model.length === 0 || baseUrl.length === 0) {
+    throw new Error("AI_API_KEY, AI_VISION_MODEL, and AI_API_BASE_URL are required when AI_PROVIDER is openai.");
+  }
+  return { provider: "openai", model, apiKey, baseUrl };
+}
+
+function resolveStorage(nodeEnv: NodeEnvironment, env: NodeJS.ProcessEnv): StorageConfig {
+  const mock = {
+    provider: "mock" as const,
+    bucket: "",
+    region: "",
+    endpoint: "",
+    accessKeyId: "",
+    secretAccessKey: "",
+  };
+  if (nodeEnv === "test") {
+    return mock;
+  }
+  const raw = (env.OBJECT_STORAGE_PROVIDER ?? "").trim().toLowerCase();
+  if (nodeEnv === "production") {
+    if (raw !== "s3") {
+      throw new Error("OBJECT_STORAGE_PROVIDER must be s3 in production.");
+    }
+  } else if (raw.length === 0 || raw === "mock") {
+    return mock;
+  }
+  if (raw !== "s3") {
+    throw new Error("OBJECT_STORAGE_PROVIDER is invalid.");
+  }
+  const bucket = env.OBJECT_STORAGE_BUCKET?.trim() ?? "";
+  const region = env.OBJECT_STORAGE_REGION?.trim() ?? "";
+  const endpoint = env.OBJECT_STORAGE_ENDPOINT?.trim() ?? "";
+  const accessKeyId = env.OBJECT_STORAGE_ACCESS_KEY?.trim() ?? "";
+  const secretAccessKey = env.OBJECT_STORAGE_SECRET_KEY?.trim() ?? "";
+  if (bucket.length === 0 || region.length === 0 || accessKeyId.length < 8 || secretAccessKey.length < 8) {
+    throw new Error(
+      "OBJECT_STORAGE_BUCKET, OBJECT_STORAGE_REGION, OBJECT_STORAGE_ACCESS_KEY, and OBJECT_STORAGE_SECRET_KEY are required.",
+    );
+  }
+  return { provider: "s3", bucket, region, endpoint, accessKeyId, secretAccessKey };
 }
 
 function resolveOtpProvider(

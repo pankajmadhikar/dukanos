@@ -317,9 +317,9 @@ Written in the same transaction as the business change. `status` moves `PENDING 
 
 ### ai_intake_sessions and ai_intake_items
 
-A camera upload creates a session (`IMAGE` or `VIDEO`) and suggested lines. Status moves `UPLOADED → PROCESSING → DRAFT_READY → CONFIRMED`, or `REJECTED` or `FAILED`. Items can be `PENDING`, `ACCEPTED`, or `REJECTED`. Names can be stored in English, Hindi, and Marathi. `matched_product_id` is a suggestion inside the same shop. `confirmed_purchase_id` is filled only after a normal purchase row exists. Setting the session to `CONFIRMED` by itself creates no movement and no balance. There is no foreign key from these tables to `inventory_movements` or `inventory_balances`.
+A camera upload creates a session (`IMAGE` or `VIDEO`) and suggested lines. The database status moves `UPLOADED → PROCESSING → DRAFT_READY → CONFIRMED`, or `REJECTED` or `FAILED`. `QUEUED` is not an enum value. The API derives it from `raw_output.job` while the row is still `UPLOADED`. That JSON also stores the processing generation, attempt count, start time, and last error code so a stale `PROCESSING` row can be retried. Items can be `PENDING`, `ACCEPTED`, or `REJECTED`. Names can be stored in English, Hindi, and Marathi. `matched_product_id` is a suggestion inside the same shop. `confirmed_purchase_id` is filled only after a normal purchase row exists. Setting the session to `CONFIRMED` by itself creates no movement and no balance. There is no foreign key from these tables to `inventory_movements` or `inventory_balances`.
 
-The application stores upload metadata in `raw_output` and extra suggestion fields (SKU, unit, match type, shopkeeper edits) in `raw_suggestion`. Confidence is one score per item. There is no per-field confidence column. Media retention is not a database lifecycle. The API confirmation path creates a normal purchase or opening adjustment first, then sets `CONFIRMED` and, for a purchase, `confirmed_purchase_id`. A row updated to `CONFIRMED` without that business write still creates no stock.
+The application stores upload metadata and job state in `raw_output` and extra suggestion fields (SKU, unit, match type, shopkeeper edits, optional evidence) in `raw_suggestion`. Confidence is one score per item. There is no per-field confidence column. Media retention is an application policy, not a database lifecycle. The API confirmation path creates a normal purchase or opening adjustment first, then sets `CONFIRMED` and, for a purchase, `confirmed_purchase_id`. A row updated to `CONFIRMED` without that business write still creates no stock.
 
 ## Important fields
 
@@ -542,7 +542,8 @@ Purchases and supplier payments are not subtracted from profit. They move cash o
 ## AI intake model
 
 ```
-upload -> ai_intake_sessions (UPLOADED)
+upload verified -> ai_intake_sessions (QUEUED in raw_output, database status UPLOADED)
+      -> worker claims PROCESSING, provider runs outside the transaction
       -> provider fills ai_intake_items (DRAFT_READY)
       -> shopkeeper edits quantity and prices
       -> application posts a purchase, or an opening adjustment, through the existing services
@@ -550,7 +551,7 @@ upload -> ai_intake_sessions (UPLOADED)
       -> confirmed_purchase_id is set only when that write was a purchase
 ```
 
-The last step is the normal purchase or opening-stock transaction. The provider does not write those tables. The AI tables do not participate in stock triggers. Tests assert that a `CONFIRMED` session with an accepted item, inserted directly, still leaves `inventory_movements` empty, and that no foreign key reaches the stock tables. This phase uses a mock provider. Video processing is not enabled. A real vision provider is not connected.
+The last step is the normal purchase or opening-stock transaction. The provider does not write those tables. The AI tables do not participate in stock triggers. Tests assert that a `CONFIRMED` session with an accepted item, inserted directly, still leaves `inventory_movements` empty, and that no foreign key reaches the stock tables. Processing is asynchronous. The provider call is not inside the database transaction. Tests use a mock provider and mock storage. Production configuration refuses that fallback and requires the OpenAI-compatible provider plus private S3-compatible storage. Video processing is not enabled.
 
 ## Idempotency
 

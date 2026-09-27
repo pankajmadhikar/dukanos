@@ -51,7 +51,11 @@ export type ShopAuditAction =
   | "ai_intake.processed"
   | "ai_intake.item_updated"
   | "ai_intake.item_rejected"
-  | "ai_intake.confirmed";
+  | "ai_intake.confirmed"
+  | "ai_intake.processing_failed"
+  | "ai_intake.processing_retried"
+  | "ai_intake.media_uploaded"
+  | "ai_intake.media_deleted";
 
 export interface ShopAuditEvent {
   action: ShopAuditAction;

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Headers, HttpCode, Param, Patch, Post } from "@nestjs/common";
+import { Body, Controller, Get, Headers, HttpCode, Param, Patch, Post, Req } from "@nestjs/common";
 import {
   ApiBearerAuth,
   ApiConflictResponse,
@@ -16,6 +16,7 @@ import { RequestContextService } from "../context/request-context.service";
 import { intakeActor, ManageIntake } from "./ai-intake.access";
 import { AiIntakeService } from "./ai-intake.service";
 import { ConfirmIntakeDto, CreateIntakeDto, UpdateIntakeItemDto, UploadUrlDto } from "./dto/ai-intake.dto";
+import type { Request } from "express";
 
 @ApiTags("ai-intake")
 @ApiBearerAuth("session")
@@ -65,17 +66,50 @@ export class AiIntakeController {
   @Post(":intakeId/process")
   @HttpCode(200)
   @ApiOperation({
-    summary: "Analyze an uploaded image",
+    summary: "Queue analysis of an uploaded image",
     description:
-      "Turns the image into draft suggestions. A session already being processed returns a conflict. Analysis does not create products or stock.",
+      "Verifies the private object and queues processing. The response is the current status, usually QUEUED. Analysis does not create products or stock. Poll the intake until it is DRAFT_READY or FAILED.",
   })
   @ApiConflictResponse({ description: "CONFLICT when processing is already running or already finished." })
   async process(
     @CurrentUser() user: CurrentUserPrincipal,
     @CurrentTenant() tenant: CurrentTenantPrincipal,
     @Param("intakeId") intakeId: string,
+    @Req() request: Request,
   ) {
-    const data = await this.intake.process(intakeActor(user, tenant), intakeId);
+    const data = await this.intake.process(intakeActor(user, tenant), intakeId, request.ip);
+    return { data, requestId: this.requestId() };
+  }
+
+  @Post(":intakeId/retry")
+  @HttpCode(200)
+  @ApiOperation({
+    summary: "Retry a failed intake",
+    description: "Queues the same image again after a retryable failure. A confirmed or ready draft is not sent back to the provider.",
+  })
+  @ApiConflictResponse({ description: "AI_INTAKE_NOT_RETRYABLE, AI_INTAKE_RETRY_LIMIT, or CONFLICT." })
+  async retry(
+    @CurrentUser() user: CurrentUserPrincipal,
+    @CurrentTenant() tenant: CurrentTenantPrincipal,
+    @Param("intakeId") intakeId: string,
+    @Req() request: Request,
+  ) {
+    const data = await this.intake.retry(intakeActor(user, tenant), intakeId, request.ip);
+    return { data, requestId: this.requestId() };
+  }
+
+  @Get(":intakeId/media-url")
+  @ApiOperation({
+    summary: "Request a short-lived download URL",
+    description: "Returns a private download URL for this shop's intake image. The URL expires. Other shops receive not found.",
+  })
+  @ApiNotFoundResponse({ description: "AI_INTAKE_NOT_FOUND or AI_INTAKE_MEDIA_NOT_FOUND" })
+  async mediaUrl(
+    @CurrentUser() user: CurrentUserPrincipal,
+    @CurrentTenant() tenant: CurrentTenantPrincipal,
+    @Param("intakeId") intakeId: string,
+  ) {
+    const data = await this.intake.mediaUrl(intakeActor(user, tenant), intakeId);
     return { data, requestId: this.requestId() };
   }
 
