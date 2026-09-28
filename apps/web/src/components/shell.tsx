@@ -1,8 +1,12 @@
-import type { ReactNode } from "react";
-import { NavLink, Navigate, Outlet, useNavigate } from "react-router";
+import { useEffect, useState, type ReactNode } from "react";
+import { Link, NavLink, Navigate, Outlet, useNavigate } from "react-router";
 import { shopApi } from "../lib/api/shop";
 import { can, roleLabel } from "../lib/permissions";
+import { useOffline, usePosOnline } from "../offline/connectivity";
+import { queueCounts } from "../offline/queue";
+import { startOfflineSync } from "../offline/sync";
 import { useSession } from "../stores/session";
+import { useToast } from "../stores/toast";
 import { ToastHost } from "./ui";
 
 const primary = [
@@ -36,6 +40,22 @@ export function Shell() {
   const shop = useSession((state) => state.shop);
   const user = useSession((state) => state.user);
   const role = shop?.role;
+  const online = usePosOnline();
+  const waiting = useOffline((state) => state.waiting);
+  const attention = useOffline((state) => state.attention);
+  const signInAgain = useOffline((state) => state.signInAgain);
+  const lastSynced = useOffline((state) => state.lastSynced);
+  const [seenSynced, setSeenSynced] = useState(0);
+  useEffect(() => {
+    if (shop?.id) startOfflineSync(shop.id);
+  }, [shop?.id]);
+  useEffect(() => {
+    if (lastSynced > seenSynced) {
+      const count = lastSynced - seenSynced;
+      useToast.getState().show(count === 1 ? "Sale synced" : `${count} sales synced`);
+      setSeenSynced(lastSynced);
+    }
+  }, [lastSynced, seenSynced]);
   const visiblePrimary = primary.filter((item) => can(role, item.action));
   const visibleMore = more.filter((item) => can(role, item.action));
   const bottom = [
@@ -65,9 +85,28 @@ export function Shell() {
             <p className="text-sm text-muted">
               {displayName(user)} · {roleLabel(role)}
             </p>
+            <Link to="/sync" className="text-sm font-semibold">
+              <span className={online ? "text-good" : "text-bad"}>{online ? "● Online" : "● Offline"}</span>
+            </Link>
           </div>
-          <LogoutButton />
+          <LogoutButton tenantId={shop?.id ?? ""} />
         </header>
+        {!online ? (
+          <p className="bg-card px-4 py-2 text-sm">Offline mode. Sales will sync when internet returns.</p>
+        ) : null}
+        {signInAgain ? (
+          <p className="bg-card px-4 py-2 text-sm">Sales saved locally. Connect to the internet and sign in again to sync.</p>
+        ) : null}
+        {waiting > 0 ? (
+          <Link to="/sync" className="block bg-card px-4 py-2 text-sm font-semibold">
+            {waiting} {waiting === 1 ? "sale" : "sales"} waiting to sync
+          </Link>
+        ) : null}
+        {attention > 0 ? (
+          <Link to="/sync" className="block bg-card px-4 py-2 text-sm font-semibold text-bad">
+            {attention} {attention === 1 ? "sale needs" : "sales need"} attention
+          </Link>
+        ) : null}
         <main className="flex-1 px-4 py-4 pb-24 lg:pb-6">
           <Outlet />
         </main>
@@ -103,21 +142,40 @@ function SideLink({ to, label }: { to: string; label: string }) {
   );
 }
 
-function LogoutButton() {
+function LogoutButton({ tenantId }: { tenantId: string }) {
   const navigate = useNavigate();
   const clear = useSession((state) => state.clear);
+  const [hold, setHold] = useState<string | null>(null);
   return (
-    <button
-      type="button"
-      className="min-h-12 rounded-xl px-3 font-semibold"
-      onClick={() => {
-        void shopApi.logout().catch(() => undefined);
-        clear();
-        navigate("/login");
-      }}
-    >
-      Log out
-    </button>
+    <div className="text-right">
+      <button
+        type="button"
+        className="min-h-12 rounded-xl px-3 font-semibold"
+        onClick={() => {
+          void queueCounts(tenantId)
+            .then((counts) => {
+              const pending = counts.waiting + counts.attention;
+              if (pending > 0) {
+                setHold(
+                  `${pending} ${pending === 1 ? "sale is" : "sales are"} waiting to sync. Please connect to the internet before logging out.`,
+                );
+                return;
+              }
+              void shopApi.logout().catch(() => undefined);
+              clear();
+              navigate("/login");
+            })
+            .catch(() => {
+              void shopApi.logout().catch(() => undefined);
+              clear();
+              navigate("/login");
+            });
+        }}
+      >
+        Log out
+      </button>
+      {hold ? <p className="max-w-64 text-sm text-bad">{hold}</p> : null}
+    </div>
   );
 }
 

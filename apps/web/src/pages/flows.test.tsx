@@ -5,6 +5,7 @@ import { createMemoryRouter, RouterProvider } from "react-router";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { routes } from "../app/router";
 import { ApiError } from "../lib/api/client";
+import { useOffline } from "../offline/connectivity";
 import { asList, asRecord, asText, type Json } from "../lib/json";
 import { useSession } from "../stores/session";
 
@@ -285,5 +286,18 @@ describe("shop flows", () => {
     await user.click(screen.getByRole("button", { name: "Confirm stock" }));
     expect(await screen.findByText(/Nothing was added/)).toBeInTheDocument();
     expect(screen.getByText(/We found 2 products/)).toBeInTheDocument();
+  });
+
+  it("keeps purchases, closing, and returns online only", async () => {
+    owner();
+    useOffline.getState().setBrowserOnline(false);
+    renderAt("/purchases");
+    expect(await screen.findByRole("heading", { name: "Purchases require an internet connection." })).toBeInTheDocument();
+    renderAt("/daily-closing");
+    expect(await screen.findByRole("heading", { name: "Daily closing requires an internet connection." })).toBeInTheDocument();
+    renderAt("/sales/sale-1");
+    expect(await screen.findByRole("heading", { name: "Returns require an internet connection." })).toBeInTheDocument();
+    renderAt("/expenses");
+    expect(await screen.findByRole("heading", { name: "Expenses require an internet connection." })).toBeInTheDocument();
   });
 });

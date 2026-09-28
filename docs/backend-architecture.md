@@ -134,6 +134,12 @@ A new sale records only `CASH` or `UPI`. The shopkeeper confirms that the money 
 
 The same transaction adds the sale to `daily_summaries` for that business date: sales total, net sales, cash received, credit sales, quantity sold, transaction count, and gross profit. Closing receivable and payable balances stay for a later rebuild.
 
+A sale created on a device while it had no connection is posted later through the same `SalesService.create` path. The body sets `source` to `OFFLINE_SYNC` and includes the selling price the device had cached. The server stores that price when it is the current price, a selling price from the last 30 `product_price_history` rows, or the current customer price. Any other price is `SALE_PRICE_MISMATCH`. An online sale still omits `source`. An online `unitPrice` must match the current resolved price. `OFFLINE_SYNC` ignores a browser `saleDate`. The shop timezone still chooses the business date, and the server clock still chooses the transaction time. The sale number still comes from `next_document_number`. Stock, the customer ledger, payments, and `daily_summaries` are written only inside that sale transaction. There is no offline ledger and no offline payment table.
+
+The idempotency key is claimed inside the same transaction. The hash includes `source` and the offered price. The same key and the same body return the original sale, including when the device lost the first response. A different body returns `IDEMPOTENCY_CONFLICT`. A rolled-back attempt, such as `INSUFFICIENT_STOCK`, removes the key so a later corrected body can use it. The first successful post writes `sale.created` with metadata `{ source: "OFFLINE_SYNC" }`. A replay does not write that audit again.
+
+`GET /api/v1/pos/catalog`, `/api/v1/pos/customers`, and `/api/v1/pos/customer-prices` page the data a till needs. Each page is at most 100 rows. The catalog includes the selling price, barcodes, and quantity at the default location. It does not include purchase price, average cost, or profit. Customer outstanding on that response is a snapshot for the device. The ledger remains authoritative. Any signed-in shop role can read these routes. Creating the sale still requires the sales permission on the current session.
+
 ## Returns
 
 `SalesReturnsModule` posts a confirmed return against an existing sale. `PurchaseReturnsModule` posts a confirmed return against an existing purchase. Neither module writes `inventory_balances` or `inventory_movements` itself. Each line calls `InventoryLedgerService.post`.

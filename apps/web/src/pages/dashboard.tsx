@@ -1,15 +1,38 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router";
 import { ErrorState, Loading, Money } from "../components/ui";
-import { formatBusinessDate, formatQty, percentLabel } from "../lib/format";
+import { formatBusinessDate, formatInstant, formatQty, percentLabel } from "../lib/format";
 import { shopApi } from "../lib/api/shop";
 import { asNumber, asRecord, asText, type Json } from "../lib/json";
 import { can } from "../lib/permissions";
+import { loadSnapshot, saveSnapshot } from "../offline/catalog";
+import { useOffline, usePosOnline } from "../offline/connectivity";
 import { useSession } from "../stores/session";
 
 export function DashboardPage() {
   const role = useSession((state) => state.shop?.role);
-  const today = useQuery({ queryKey: ["dashboard", "today"], queryFn: () => shopApi.dashboardToday() });
+  const shopId = useSession((state) => state.shop?.id) ?? "";
+  const online = usePosOnline();
+  const waiting = useOffline((state) => state.waiting);
+  const today = useQuery({
+    queryKey: ["dashboard", "today", shopId],
+    networkMode: "always",
+    queryFn: async () => {
+      try {
+        const body = await shopApi.dashboardToday();
+        if (shopId) await saveSnapshot(shopId, "dashboard", body).catch(() => undefined);
+        return body;
+      } catch (error) {
+        if (shopId) {
+          const cached = await loadSnapshot(shopId, "dashboard").catch(() => null);
+          if (cached && asRecord(cached.value)) {
+            return { ...asRecord(cached.value), offlineSavedAt: cached.savedAt } as Record<string, Json>;
+          }
+        }
+        throw error;
+      }
+    },
+  });
   const comparison = useQuery({
     queryKey: ["dashboard", "comparison"],
     queryFn: () => shopApi.dashboardComparison(),
@@ -26,6 +49,7 @@ export function DashboardPage() {
   }
 
   const data = asRecord(today.data?.data);
+  const savedAt = asText(asRecord(today.data)?.offlineSavedAt);
   const sales = asRecord(data?.sales);
   const collections = asRecord(data?.collections);
   const outstanding = asRecord(data?.outstanding);
@@ -38,6 +62,17 @@ export function DashboardPage() {
       <header>
         <p className="text-sm text-muted">{formatBusinessDate(asText(data?.businessDate))}</p>
         <h1 className="text-2xl font-semibold">How is the shop doing today?</h1>
+        {!online ? (
+          <p className="text-sm text-muted">
+            Offline
+            {waiting > 0 ? ` · ${waiting} ${waiting === 1 ? "sale" : "sales"} waiting to sync` : ""}
+            {savedAt
+              ? ` · Last updated ${formatInstant(savedAt)}`
+              : today.dataUpdatedAt > 0
+                ? ` · Last updated ${formatInstant(new Date(today.dataUpdatedAt).toISOString())}`
+                : ""}
+          </p>
+        ) : null}
       </header>
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         <Metric label="Sales" value={asText(sales?.netSales)} change={salesChange} />

@@ -17,6 +17,9 @@ export function MorePage() {
   return (
     <section className="mx-auto flex w-full max-w-lg flex-col gap-3">
       <h1 className="text-2xl font-semibold">More</h1>
+      <Link to="/sync" className="rounded-2xl bg-card px-4 py-4 text-lg font-semibold">
+        Sync
+      </Link>
       {links
         .filter((item) => can(role, item.action))
         .map((item) => (

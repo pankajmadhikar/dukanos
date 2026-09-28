@@ -19,6 +19,7 @@ import { shopApi } from "../lib/api/shop";
 import { formatBusinessDate, formatQty, moneyInput, stockInput } from "../lib/format";
 import { asList, asRecord, asText } from "../lib/json";
 import { can } from "../lib/permissions";
+import { usePosOnline } from "../offline/connectivity";
 import { useSession } from "../stores/session";
 import { useToast } from "../stores/toast";
 
@@ -258,6 +259,7 @@ function ProductForm() {
 export function ProductDetailPage() {
   const { productId = "" } = useParams();
   const role = useSession((state) => state.shop?.role);
+  const online = usePosOnline();
   const queryClient = useQueryClient();
   const product = useQuery({ queryKey: ["product", productId], queryFn: () => shopApi.product(productId) });
   const history = useQuery({ queryKey: ["price-history", productId], queryFn: () => shopApi.priceHistory(productId) });
@@ -303,11 +305,12 @@ export function ProductDetailPage() {
           </div>
         )}
       </Gate>
-      {can(role, "catalog.manage") && active ? (
+      {can(role, "catalog.manage") && active && online ? (
         <Button tone="danger" onClick={() => setConfirm(true)}>
           Deactivate product
         </Button>
       ) : null}
+      {can(role, "catalog.manage") && active && !online ? <p>Editing a product requires an internet connection.</p> : null}
       {confirm ? (
         <ConfirmDialog
           title="Deactivate this product?"

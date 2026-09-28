@@ -114,7 +114,7 @@ npm install
 npm run dev
 ```
 
-Open `http://localhost:5173`. The API must already be running. The only public setting is `VITE_API_BASE_URL`.
+Open `http://localhost:5173`. The API must already be running. The only public setting is `VITE_API_BASE_URL`. Offline selling is described in `docs/offline-pos.md`. The browser keeps a queue. PostgreSQL remains the source of truth.
 
 11. Run tests.
 

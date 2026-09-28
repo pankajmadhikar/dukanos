@@ -6,13 +6,14 @@ export interface CartLine {
   quantity: string;
   listPrice: string | null;
   stock: string | null;
+  cachedPrice: string | null;
 }
 
 interface CartState {
   lines: CartLine[];
   customerId: string | null;
   customerName: string | null;
-  add: (line: Omit<CartLine, "quantity"> & { quantity?: string }) => void;
+  add: (line: Omit<CartLine, "quantity" | "cachedPrice"> & { quantity?: string; cachedPrice?: string | null }) => void;
   setQuantity: (productId: string, quantity: string) => void;
   remove: (productId: string) => void;
   setCustomer: (customer: { id: string; name: string } | null) => void;
@@ -36,7 +37,7 @@ export const useCart = create<CartState>((set) => ({
         };
       }
       return {
-        lines: [...state.lines, { ...line, quantity: line.quantity ?? "1" }],
+        lines: [...state.lines, { cachedPrice: line.cachedPrice ?? line.listPrice, ...line, quantity: line.quantity ?? "1" }],
       };
     }),
   setQuantity: (productId, quantity) =>

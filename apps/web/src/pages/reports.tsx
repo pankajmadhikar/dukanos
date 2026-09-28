@@ -2,7 +2,9 @@ import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { ErrorState, Loading, Money, Page } from "../components/ui";
 import { shopApi } from "../lib/api/shop";
-import { formatBusinessDate } from "../lib/format";
+import { formatBusinessDate, formatInstant } from "../lib/format";
+import { loadSnapshot, saveSnapshot } from "../offline/catalog";
+import { usePosOnline } from "../offline/connectivity";
 import { asList, asRecord, asText, type Json } from "../lib/json";
 import { can } from "../lib/permissions";
 import { useSession } from "../stores/session";
@@ -17,6 +19,8 @@ const periods = [
 
 export function ReportsPage() {
   const role = useSession((state) => state.shop?.role);
+  const shopId = useSession((state) => state.shop?.id) ?? "";
+  const online = usePosOnline();
   const [section, setSection] = useState("sales");
   const [period, setPeriod] = useState("today");
   const [from, setFrom] = useState("");
@@ -25,7 +29,22 @@ export function ReportsPage() {
   const sales = useQuery({
     queryKey: ["reports", "sales", period, from, to],
     enabled: section === "sales" && customReady,
-    queryFn: () => shopApi.reportSales(period, period === "custom" ? from : undefined, period === "custom" ? to : undefined),
+    networkMode: "always",
+    queryFn: async () => {
+      try {
+        const body = await shopApi.reportSales(period, period === "custom" ? from : undefined, period === "custom" ? to : undefined);
+        if (shopId) await saveSnapshot(shopId, "report-sales", body).catch(() => undefined);
+        return body;
+      } catch (error) {
+        if (shopId) {
+          const cached = await loadSnapshot(shopId, "report-sales").catch(() => null);
+          if (cached && asRecord(cached.value)) {
+            return { ...asRecord(cached.value), offlineSavedAt: cached.savedAt } as Record<string, Json>;
+          }
+        }
+        throw error;
+      }
+    },
   });
   const products = useQuery({
     queryKey: ["reports", "products", period, from, to],
@@ -84,6 +103,16 @@ export function ReportsPage() {
 
   return (
     <Page title="Reports">
+      {!online ? (
+        <p className="text-sm text-muted">
+          {asText(asRecord(sales.data)?.offlineSavedAt)
+            ? `Last updated ${formatInstant(asText(asRecord(sales.data)?.offlineSavedAt))}. `
+            : sales.dataUpdatedAt > 0
+              ? `Last updated ${formatInstant(new Date(sales.dataUpdatedAt).toISOString())}. `
+              : ""}
+          These figures are not current.
+        </p>
+      ) : null}
       <div className="flex flex-wrap gap-2">
         {sections.map((item) => (
           <button key={item} type="button" className={`min-h-12 rounded-full px-4 font-semibold capitalize ${section === item ? "bg-accent text-accent-ink" : "bg-card"}`} onClick={() => setSection(item)}>

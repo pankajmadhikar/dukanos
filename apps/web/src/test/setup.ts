@@ -21,6 +21,7 @@ if (!URL.revokeObjectURL) {
 }
 import { afterEach } from "vitest";
 import { cleanup } from "@testing-library/react";
+import { useOffline } from "../offline/connectivity";
 import { useSession } from "../stores/session";
 import { useCart } from "../stores/cart";
 
@@ -28,4 +29,13 @@ afterEach(() => {
   cleanup();
   useSession.getState().clear();
   useCart.getState().clear();
+  useOffline.setState({
+    browserOnline: true,
+    apiReachable: true,
+    waiting: 0,
+    attention: 0,
+    catalogUpdatedAt: null,
+    signInAgain: false,
+    lastSynced: 0,
+  });
 });

@@ -84,6 +84,15 @@ export class CreateSaleDto {
   @MaxLength(500)
   notes?: string;
 
+  @ApiPropertyOptional({
+    enum: ["OFFLINE_SYNC"],
+    description:
+      "Set only when posting a sale the shop saved while offline. The selling price on each line must be a price this shop has already used. Online sales omit this field.",
+  })
+  @IsOptional()
+  @IsIn(["OFFLINE_SYNC"])
+  source?: "OFFLINE_SYNC";
+
   @ApiProperty({ type: [SaleItemDto] })
   @ArrayMinSize(1)
   @ArrayMaxSize(50)

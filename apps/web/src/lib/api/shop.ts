@@ -52,6 +52,9 @@ export const shopApi = {
     request("/api/v1/inventory/opening", { method: "POST", body, idempotencyKey }),
   adjustStock: (body: Json, idempotencyKey: string) =>
     request("/api/v1/inventory/adjustments", { method: "POST", body, idempotencyKey }),
+  posCatalog: (page: number) => request(`/api/v1/pos/catalog${query({ page, limit: 100 })}`),
+  posCustomers: (page: number) => request(`/api/v1/pos/customers${query({ page, limit: 100 })}`),
+  posCustomerPrices: (page: number) => request(`/api/v1/pos/customer-prices${query({ page, limit: 100 })}`),
   quoteSale: (body: Json) => request("/api/v1/sales/quote", { method: "POST", body }),
   createSale: (body: Json, idempotencyKey: string) =>
     request("/api/v1/sales", { method: "POST", body, idempotencyKey }),

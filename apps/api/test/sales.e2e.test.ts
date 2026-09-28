@@ -702,6 +702,79 @@ describe("sales", () => {
     }
   });
 
+  it("accepts an offline sale at a known selling price and still rejects negative stock", async () => {
+    const productId = await createProduct("Parle-G", "10.00");
+    await openStock(productId, "10", "6.00");
+    const raised = await authed(ownerToken, ownerShop)
+      .patch(`/api/v1/catalog/products/${productId}`)
+      .send({ defaultSellingPrice: "12.00" });
+    assert.equal(raised.status, 200, JSON.stringify(raised.body));
+
+    const key = `offline-sale:${productId}`;
+    const offlineBody = {
+      source: "OFFLINE_SYNC",
+      items: [{ productId, quantity: "7", unitPrice: "10.00" }],
+      payments: [{ method: "CASH", amount: "70.00" }],
+    };
+    const posted = await authed(ownerToken, ownerShop).post("/api/v1/sales").set("Idempotency-Key", key).send(offlineBody);
+    assert.equal(posted.status, 201, JSON.stringify(posted.body));
+    assert.equal(posted.body.data.items[0].unitPrice, "10.00");
+    assert.match(posted.body.data.saleNumber as string, /^S-\d{5}$/);
+    await assertStock(productId, "3.000", "6.00");
+
+    const replay = await authed(ownerToken, ownerShop).post("/api/v1/sales").set("Idempotency-Key", key).send(offlineBody);
+    assert.equal(replay.status, 201, JSON.stringify(replay.body));
+    assert.equal(replay.body.data.id, posted.body.data.id);
+    assert.equal(await movementCount(productId), "2");
+    const audits = await admin.query<{ created: string; source: string | null }>(
+      `SELECT
+         (SELECT count(*)::text FROM audit_logs WHERE entity_id = $1::uuid AND action = 'sale.created') AS created,
+         (SELECT metadata->>'source' FROM audit_logs WHERE entity_id = $1::uuid AND action = 'sale.created' LIMIT 1) AS source`,
+      [posted.body.data.id],
+    );
+    assert.equal(audits.rows[0]?.created, "1");
+    assert.equal(audits.rows[0]?.source, "OFFLINE_SYNC");
+
+    const changed = await authed(ownerToken, ownerShop)
+      .post("/api/v1/sales")
+      .set("Idempotency-Key", key)
+      .send({ ...offlineBody, items: [{ productId, quantity: "1", unitPrice: "10.00" }] });
+    assert.equal(changed.status, 409);
+    assert.equal(changed.body.error.code, "IDEMPOTENCY_CONFLICT");
+
+    const livePrice = await authed(ownerToken, ownerShop)
+      .post("/api/v1/sales")
+      .send({ items: [{ productId, quantity: "1", unitPrice: "10.00" }], payments: [{ method: "CASH", amount: "10.00" }] });
+    assert.equal(livePrice.status, 409);
+    assert.equal(livePrice.body.error.code, "SALE_PRICE_MISMATCH");
+
+    const short = await authed(ownerToken, ownerShop)
+      .post("/api/v1/sales")
+      .send({
+        source: "OFFLINE_SYNC",
+        items: [{ productId, quantity: "6", unitPrice: "12.00" }],
+        payments: [{ method: "CASH", amount: "72.00" }],
+      });
+    assert.equal(short.status, 409);
+    assert.equal(short.body.error.code, "INSUFFICIENT_STOCK");
+    assert.match(short.body.error.message as string, /Available: 3/);
+    assert.match(short.body.error.message as string, /Requested: 6/);
+    await assertStock(productId, "3.000", "6.00");
+
+    const catalog = await authed(cashierToken, cashierShop).get("/api/v1/pos/catalog?limit=100");
+    assert.equal(catalog.status, 200, JSON.stringify(catalog.body));
+    const row = (catalog.body.data as Array<Record<string, unknown>>).find((item) => item.productId === productId);
+    assert.ok(row);
+    assert.equal(row?.sellingPrice, "12.00");
+    assert.equal(row?.quantity, "3.000");
+    assert.equal("purchasePrice" in (row ?? {}), false);
+    assert.equal("averageCost" in (row ?? {}), false);
+    const customers = await authed(cashierToken, cashierShop).get("/api/v1/pos/customers?limit=100");
+    assert.equal(customers.status, 200, JSON.stringify(customers.body));
+    const prices = await authed(cashierToken, cashierShop).get("/api/v1/pos/customer-prices?limit=100");
+    assert.equal(prices.status, 200, JSON.stringify(prices.body));
+  });
+
   function authed(token: string, shopContext: string) {
     const http = request(app.getHttpServer());
     const headers = (method: "get" | "post" | "patch" | "delete") => (path: string) =>

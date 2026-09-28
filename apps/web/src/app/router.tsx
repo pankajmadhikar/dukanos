@@ -15,6 +15,8 @@ import { NewPurchasePage, PurchaseDetailPage, PurchasesPage } from "../pages/pur
 import { ReportsPage } from "../pages/reports";
 import { SaleDetailPage, SalesPage } from "../pages/sales";
 import { SellPage } from "../pages/sell";
+import { SyncPage } from "../pages/sync";
+import { InternetGate } from "../components/internet-gate";
 import { SettingsPage } from "../pages/settings";
 import { ShopsPage } from "../pages/shops";
 import { AddStockPage, StockPage } from "../pages/stock";
@@ -50,26 +52,27 @@ export const routes: RouteObject[] = [
       { path: "/dashboard", element: <DashboardPage /> },
       { path: "/sell", element: <SellPage /> },
       { path: "/products", element: <ProductsPage /> },
-      { path: "/products/new", element: <ProductFormPage /> },
+      { path: "/products/new", element: <InternetGate sentence="Adding a product requires an internet connection."><ProductFormPage /></InternetGate> },
       { path: "/products/:productId", element: <ProductDetailPage /> },
       { path: "/stock", element: <StockPage /> },
-      { path: "/stock/add", element: <AddStockPage /> },
+      { path: "/stock/add", element: <InternetGate sentence="Stock changes require an internet connection."><AddStockPage /></InternetGate> },
       { path: "/customers", element: <CustomersPage /> },
       { path: "/customers/:customerId", element: <CustomerDetailPage /> },
-      { path: "/purchases", element: <PurchasesPage /> },
-      { path: "/purchases/new", element: <NewPurchasePage /> },
-      { path: "/purchases/:purchaseId", element: <PurchaseDetailPage /> },
+      { path: "/purchases", element: <InternetGate sentence="Purchases require an internet connection."><PurchasesPage /></InternetGate> },
+      { path: "/purchases/new", element: <InternetGate sentence="Purchases require an internet connection."><NewPurchasePage /></InternetGate> },
+      { path: "/purchases/:purchaseId", element: <InternetGate sentence="Purchases require an internet connection."><PurchaseDetailPage /></InternetGate> },
       { path: "/suppliers", element: <SuppliersPage /> },
       { path: "/suppliers/:supplierId", element: <SupplierDetailPage /> },
       { path: "/sales", element: <SalesPage /> },
-      { path: "/sales/:saleId", element: <SaleDetailPage /> },
-      { path: "/expenses", element: <ExpensesPage /> },
+      { path: "/sales/:saleId", element: <InternetGate sentence="Returns require an internet connection."><SaleDetailPage /></InternetGate> },
+      { path: "/expenses", element: <InternetGate sentence="Expenses require an internet connection."><ExpensesPage /></InternetGate> },
       { path: "/reports", element: <ReportsPage /> },
-      { path: "/daily-closing", element: <ClosingPage /> },
-      { path: "/ai", element: <IntakePage /> },
+      { path: "/daily-closing", element: <InternetGate sentence="Daily closing requires an internet connection."><ClosingPage /></InternetGate> },
+      { path: "/ai", element: <InternetGate sentence="Camera add requires an internet connection."><IntakePage /></InternetGate> },
+      { path: "/sync", element: <SyncPage /> },
       { path: "/settings", element: <SettingsPage /> },
       { path: "/more", element: <MorePage /> },
-      { path: "/masters", element: <MastersPage /> },
+      { path: "/masters", element: <InternetGate sentence="Categories and brands require an internet connection."><MastersPage /></InternetGate> },
     ],
   },
 ];

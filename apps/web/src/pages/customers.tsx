@@ -7,26 +7,46 @@ import { ApiError } from "../lib/api/client";
 import { shopApi } from "../lib/api/shop";
 import { formatBusinessDate, moneyInput, toPaise } from "../lib/format";
 import { asList, asRecord, asText } from "../lib/json";
+import { usePosOnline } from "../offline/connectivity";
 import { useToast } from "../stores/toast";
 
 export function CustomersPage() {
   const [params] = useSearchParams();
+  const online = usePosOnline();
   const [search, setSearch] = useState("");
   const [open, setOpen] = useState(params.get("new") === "1");
+  const [offlineNotice, setOfflineNotice] = useState(false);
   const debounced = useDebounced(search);
   const customers = useQuery({
     queryKey: ["customers", debounced],
     queryFn: () => shopApi.customers(debounced, 1),
   });
   return (
-    <Page title="Customers" action={<Button onClick={() => setOpen(true)}>+ Add customer</Button>}>
+    <Page
+      title="Customers"
+      action={
+        <Button
+          onClick={() => {
+            if (!online) {
+              setOfflineNotice(true);
+              return;
+            }
+            setOfflineNotice(false);
+            setOpen(true);
+          }}
+        >
+          + Add customer
+        </Button>
+      }
+    >
       <input
         className={controlClass}
         placeholder="Search name or phone"
         value={search}
         onChange={(event) => setSearch(event.target.value)}
       />
-      {open ? <CustomerForm onDone={() => setOpen(false)} /> : null}
+      {offlineNotice || (open && !online) ? <p>Connect to the internet to create/select this customer.</p> : null}
+      {open && online ? <CustomerForm onDone={() => setOpen(false)} /> : null}
       {customers.isLoading ? <Loading label="Loading customers..." /> : null}
       {customers.isError ? <ErrorState error={customers.error} onRetry={() => void customers.refetch()} /> : null}
       {!customers.isLoading && asList(customers.data?.data).length === 0 ? (
@@ -101,6 +121,7 @@ export function CustomerDetailPage() {
   const [amount, setAmount] = useState("");
   const [method, setMethod] = useState<"CASH" | "UPI">("CASH");
   const [error, setError] = useState<string | null>(null);
+  const online = usePosOnline();
   const person = asRecord(customer.data?.data);
   const figures = asRecord(summary.data?.data);
   const outstanding = asText(person?.receivableBalance);
@@ -159,6 +180,8 @@ export function CustomerDetailPage() {
         </article>
       </div>
       <h2 className="text-lg font-semibold">Receive payment</h2>
+      {!online ? <p>Receiving a payment requires an internet connection.</p> : null}
+      {online ? <>
       <Field label="Amount">
         <input className={controlClass} inputMode="decimal" value={amount} onChange={(event) => setAmount(event.target.value)} />
       </Field>
@@ -173,6 +196,7 @@ export function CustomerDetailPage() {
       {method === "UPI" ? <p className="text-sm text-muted">Confirm the UPI on your phone, then save.</p> : null}
       {error ? <Notice>{error}</Notice> : null}
       <Button onClick={() => void receive()}>Receive payment</Button>
+      </> : null}
       <div className="flex gap-2">
         {(["sales", "payments", "ledger"] as const).map((item) => (
           <button key={item} type="button" className={`min-h-12 rounded-xl px-3 font-semibold capitalize ${tab === item ? "bg-ink text-paper" : "bg-card"}`} onClick={() => setTab(item)}>

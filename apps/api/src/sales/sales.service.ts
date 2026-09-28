@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { HttpStatus, Injectable } from "@nestjs/common";
-import { MovementType, PaymentMethod, Prisma } from "@prisma/client";
+import { MovementType, PaymentMethod, PriceType, Prisma } from "@prisma/client";
 import { AuditRecorder } from "../audit/audit-recorder";
 import { formatMoney, formatStock, parseMoney, parseStock } from "../catalog/decimal";
 import { ProductPricingService } from "../catalog/product-pricing.service";
@@ -66,6 +66,7 @@ export class SalesService {
       body.customerId ?? "",
       body.locationId ?? "",
       body.saleDate ?? "",
+      body.source ?? "",
       body.notes?.trim() ?? "",
       ...[...items]
         .sort((left, right) => left.productId.localeCompare(right.productId))
@@ -82,7 +83,8 @@ export class SalesService {
           return replay;
         }
       }
-      const posted = await this.postSale(tx, actor, body, items, payments);
+      const posting = body.source === "OFFLINE_SYNC" ? { ...body, saleDate: undefined } : body;
+      const posted = await this.postSale(tx, actor, posting, items, payments);
       if (key) {
         await tx.idempotencyKey.update({
           where: { tenantId_key: { tenantId: actor.tenantId, key } },
@@ -238,7 +240,13 @@ export class SalesService {
   ): Promise<SaleView> {
     const customer = body.customerId ? await this.lockCustomer(tx, actor.tenantId, body.customerId) : null;
     const locationId = await this.resolveLocation(tx, actor.tenantId, body.locationId);
-    const priced = await this.priceItems(tx, actor.tenantId, body.customerId, items);
+      const priced = await this.priceItems(
+        tx,
+        actor.tenantId,
+        body.customerId,
+        items,
+        body.source === "OFFLINE_SYNC",
+      );
     const subtotal = priced.reduce((sum, item) => sum.plus(item.lineTotal), new Prisma.Decimal(0));
     const paid = payments.reduce((sum, payment) => sum.plus(payment.amount), new Prisma.Decimal(0));
     if (paid.gt(subtotal)) {
@@ -410,6 +418,7 @@ export class SalesService {
       entityId: sale.id,
       tenantId: actor.tenantId,
       actorUserId: actor.userId,
+      ...(body.source === "OFFLINE_SYNC" ? { metadata: { source: "OFFLINE_SYNC" } } : {}),
     });
     await this.audit.write(tx, {
       action: "sale.posted",
@@ -431,6 +440,7 @@ export class SalesService {
     tenantId: string,
     customerId: string | undefined,
     items: PreparedItem[],
+    offline = false,
   ): Promise<PreparedItem[]> {
     const products = await tx.product.findMany({
       where: { tenantId, id: { in: items.map((item) => item.productId) } },
@@ -462,12 +472,31 @@ export class SalesService {
           HttpStatus.CONFLICT,
         );
       }
-      if (item.offeredPrice && !item.offeredPrice.equals(resolved.price)) {
+      if (offline && !item.offeredPrice) {
         throw new AppException(
-          ErrorCode.SALE_PRICE_MISMATCH,
-          "The selling price does not match the price for this customer.",
-          HttpStatus.CONFLICT,
+          ErrorCode.VALIDATION_ERROR,
+          "An offline sale must include the selling price saved on the device.",
+          HttpStatus.BAD_REQUEST,
         );
+      }
+      if (item.offeredPrice && !item.offeredPrice.equals(resolved.price)) {
+        const known =
+          offline &&
+          (await this.knownSellingPrice(tx, tenantId, item.productId, customerId, item.offeredPrice));
+        if (!known) {
+          throw new AppException(
+            ErrorCode.SALE_PRICE_MISMATCH,
+            "The selling price does not match the price for this customer.",
+            HttpStatus.CONFLICT,
+          );
+        }
+        priced.push({
+          ...item,
+          unitPrice: item.offeredPrice,
+          lineTotal: saleLineTotal(item.quantity, item.offeredPrice),
+          priceSource: resolved.source,
+        });
+        continue;
       }
       priced.push({
         ...item,
@@ -477,6 +506,34 @@ export class SalesService {
       });
     }
     return priced;
+  }
+
+  private async knownSellingPrice(
+    tx: ShopDb,
+    tenantId: string,
+    productId: string,
+    customerId: string | undefined,
+    offered: Prisma.Decimal,
+  ): Promise<boolean> {
+    const history = await tx.productPriceHistory.findMany({
+      where: { tenantId, productId, priceType: PriceType.SELLING },
+      select: { oldPrice: true, newPrice: true },
+      orderBy: { changedAt: "desc" },
+      take: 30,
+    });
+    for (const row of history) {
+      if ((row.oldPrice && offered.equals(row.oldPrice)) || offered.equals(row.newPrice)) {
+        return true;
+      }
+    }
+    if (!customerId) {
+      return false;
+    }
+    const special = await tx.customerProductPrice.findFirst({
+      where: { tenantId, productId, customerId },
+      select: { sellingPrice: true },
+    });
+    return special !== null && offered.equals(special.sellingPrice);
   }
 
   private async lockCustomer(

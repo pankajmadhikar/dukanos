@@ -8,6 +8,7 @@ import { ApiError } from "../lib/api/client";
 import { shopApi } from "../lib/api/shop";
 import { moneyInput, toPaise } from "../lib/format";
 import { asList, asRecord, asText } from "../lib/json";
+import { usePosOnline } from "../offline/connectivity";
 import { useToast } from "../stores/toast";
 
 export function SuppliersPage() {
@@ -93,6 +94,7 @@ export function SupplierDetailPage() {
   const [amount, setAmount] = useState("");
   const [method, setMethod] = useState<"CASH" | "UPI">("CASH");
   const [error, setError] = useState<string | null>(null);
+  const online = usePosOnline();
   const row = asRecord(supplier.data?.data);
   if (supplier.isLoading) return <Loading label="Loading supplier..." />;
   if (supplier.isError) return <ErrorState error={supplier.error} onRetry={() => void supplier.refetch()} />;
@@ -107,6 +109,8 @@ export function SupplierDetailPage() {
           </p>
         ) : null}
         <h2 className="text-lg font-semibold">Pay supplier</h2>
+        {!online ? <p>Supplier payments require an internet connection.</p> : null}
+        {online ? <>
         <Field label="Amount">
           <input className={controlClass} inputMode="decimal" value={amount} onChange={(event) => setAmount(event.target.value)} />
         </Field>
@@ -144,6 +148,7 @@ export function SupplierDetailPage() {
         >
           Pay
         </Button>
+        </> : null}
       </Page>
     </Allow>
   );

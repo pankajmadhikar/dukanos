@@ -3,12 +3,22 @@ import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import { Button, ErrorState, Field, Money, Notice, controlClass } from "../components/ui";
 import { useDebounced } from "../hooks/use-debounced";
+import { loadCart, saveCart } from "../offline/active-cart";
+import { customerPrice, findBarcode, getCustomer, searchCustomers, searchProducts } from "../offline/catalog";
+import { useOffline, usePosOnline } from "../offline/connectivity";
+import { enqueueSale, lineMoney, OfflineStoreError, sumMoney } from "../offline/queue";
+import { onQueueChange, salesForShop } from "../offline/sync";
+import type { QueuedSale, StoredCart } from "../offline/types";
 import { ApiError } from "../lib/api/client";
 import { shopApi } from "../lib/api/shop";
 import { formatQty, moneyInput, stockInput, toPaise } from "../lib/format";
 import { asList, asRecord, asText, type Json } from "../lib/json";
+import { can } from "../lib/permissions";
 import { useCart } from "../stores/cart";
+import { useSession } from "../stores/session";
 import { useToast } from "../stores/toast";
+
+const CREDIT_CACHE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function SellPage() {
   const queryClient = useQueryClient();
@@ -21,6 +31,11 @@ export function SellPage() {
   const customerName = useCart((state) => state.customerName);
   const setCustomer = useCart((state) => state.setCustomer);
   const clear = useCart((state) => state.clear);
+  const shopId = useSession((state) => state.shop?.id) ?? "";
+  const userId = useSession((state) => state.user?.id) ?? "";
+  const role = useSession((state) => state.shop?.role);
+  const online = usePosOnline();
+  const catalogUpdatedAt = useOffline((state) => state.catalogUpdatedAt);
   const [search, setSearch] = useState("");
   const [customerSearch, setCustomerSearch] = useState("");
   const [payMode, setPayMode] = useState<"CASH" | "UPI" | "SPLIT" | "CREDIT">("CASH");
@@ -29,6 +44,9 @@ export function SellPage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState<Record<string, Json> | null>(null);
+  const [offlineDone, setOfflineDone] = useState<QueuedSale | null>(null);
+  const [resume, setResume] = useState<StoredCart | null>(null);
+  const [cartReady, setCartReady] = useState(false);
   const debounced = useDebounced(search);
   const debouncedCustomer = useDebounced(customerSearch);
 
@@ -43,24 +61,68 @@ export function SellPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  useEffect(() => {
+    if (!shopId) return;
+    void loadCart(shopId)
+      .then((cart) => {
+        if (cart && useCart.getState().lines.length === 0) setResume(cart);
+      })
+      .catch(() => undefined)
+      .finally(() => setCartReady(true));
+  }, [shopId]);
+
+  useEffect(() => {
+    if (!shopId || !cartReady || resume) return;
+    return useCart.subscribe((state) => {
+      void saveCart({
+        tenantId: shopId,
+        lines: state.lines,
+        customerId: state.customerId,
+        customerName: state.customerName,
+      }).catch(() => undefined);
+    });
+  }, [shopId, cartReady, resume]);
+
   const found = useQuery({
-    queryKey: ["pos", debounced],
+    queryKey: ["pos", debounced, online, shopId],
     enabled: debounced.trim().length > 0,
-    queryFn: () => shopApi.products(debounced.trim(), 1),
+    networkMode: "always",
+    queryFn: async () => {
+      if (!online) {
+        const rows = await searchProducts(shopId, debounced.trim());
+        return {
+          data: rows.map((row) => ({
+            id: row.productId,
+            name: row.name,
+            sellingPrice: row.sellingPrice,
+            quantity: row.quantity,
+            offline: true,
+          })),
+        };
+      }
+      return shopApi.products(debounced.trim(), 1);
+    },
   });
   const stockRows = useQuery({
     queryKey: ["pos-stock", debounced],
-    enabled: debounced.trim().length > 0,
+    enabled: online && debounced.trim().length > 0,
     queryFn: () => shopApi.inventory({ search: debounced.trim() }),
   });
   const people = useQuery({
-    queryKey: ["pos-customers", debouncedCustomer],
+    queryKey: ["pos-customers", debouncedCustomer, online, shopId],
     enabled: debouncedCustomer.trim().length > 0,
-    queryFn: () => shopApi.customers(debouncedCustomer.trim(), 1),
+    networkMode: "always",
+    queryFn: async () => {
+      if (!online) {
+        const rows = await searchCustomers(shopId, debouncedCustomer.trim());
+        return { data: rows.map((row) => ({ id: row.customerId, name: row.name, phone: row.phone, outstanding: row.outstanding })) };
+      }
+      return shopApi.customers(debouncedCustomer.trim(), 1);
+    },
   });
   const quote = useQuery({
     queryKey: ["quote", customerId, lines.map((line) => `${line.productId}:${line.quantity}`).join("|")],
-    enabled: lines.length > 0,
+    enabled: online && lines.length > 0,
     queryFn: () =>
       shopApi.quoteSale({
         ...(customerId ? { customerId } : {}),
@@ -87,8 +149,29 @@ export function SellPage() {
     }
   }
 
+  async function addLocalProduct(code: string): Promise<boolean> {
+    const product = await findBarcode(shopId, code);
+    if (!product) return false;
+    add({
+      productId: product.productId,
+      name: product.name,
+      listPrice: product.sellingPrice,
+      cachedPrice: product.sellingPrice,
+      stock: product.quantity,
+    });
+    setSearch("");
+    return true;
+  }
+
   async function addBarcode(code: string) {
     setError(null);
+    if (!online) {
+      const foundLocally = await addLocalProduct(code);
+      if (!foundLocally) {
+        setError("Product not available offline.\nConnect to the internet to search this product.");
+      }
+      return;
+    }
     try {
       const body = await shopApi.barcode(code);
       const product = asRecord(body.data);
@@ -103,11 +186,20 @@ export function SellPage() {
       });
       setSearch("");
     } catch (caught) {
+      if (caught instanceof ApiError && (caught.offline || caught.code === "NETWORK")) {
+        useOffline.getState().setApiReachable(false);
+        const foundLocally = await addLocalProduct(code);
+        if (foundLocally) return;
+      }
       setError(caught instanceof ApiError ? caught.shopText() : "Something went wrong.");
     }
   }
 
   async function complete() {
+    if (!online) {
+      await completeOffline();
+      return;
+    }
     if (!quoteData) {
       setError("Wait for the bill total.");
       return;
@@ -141,20 +233,19 @@ export function SellPage() {
       setError("Payment is more than the bill.");
       return;
     }
+    const payload = {
+      ...(customerId ? { customerId } : {}),
+      items: lines.map((line) => ({
+        productId: line.productId,
+        quantity: stockInput(line.quantity) ?? "1.000",
+      })),
+      ...(payments.length > 0 ? { payments } : {}),
+    };
+    const key = crypto.randomUUID();
     setBusy(true);
     setError(null);
     try {
-      const body = await shopApi.createSale(
-        {
-          ...(customerId ? { customerId } : {}),
-          items: lines.map((line) => ({
-            productId: line.productId,
-            quantity: stockInput(line.quantity) ?? "1.000",
-          })),
-          ...(payments.length > 0 ? { payments } : {}),
-        },
-        crypto.randomUUID(),
-      );
+      const body = await shopApi.createSale(payload, key);
       setDone(asRecord(body.data));
       clear();
       void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
@@ -163,10 +254,161 @@ export function SellPage() {
       void queryClient.invalidateQueries({ queryKey: ["customers"] });
       useToast.getState().show("Sale completed");
     } catch (caught) {
+      if (caught instanceof ApiError && (caught.offline || caught.code === "NETWORK" || caught.status === 0 || caught.status >= 500)) {
+        try {
+          const sale = await enqueueSale({
+            tenantId: shopId,
+            userId,
+            customerId,
+            customerName,
+            items: lines.map((line) => ({
+              productId: line.productId,
+              name: line.name,
+              quantity: stockInput(line.quantity) ?? "1.000",
+              sellingPrice: moneyInput(asText(quoted.get(line.productId)?.unitPrice) || line.listPrice || "") ?? "0.00",
+            })),
+            payments,
+            idempotencyKey: key,
+            requestBody: payload,
+          });
+          useOffline.getState().setApiReachable(false);
+          setOfflineDone(sale);
+          clear();
+          void queryClient.invalidateQueries({ queryKey: ["pos"] });
+          return;
+        } catch (storeError) {
+          setError(storeError instanceof OfflineStoreError ? storeError.message : "The sale could not be saved on this device.");
+          return;
+        }
+      }
       setError(caught instanceof ApiError ? caught.shopText() : "Something went wrong.");
     } finally {
       setBusy(false);
     }
+  }
+
+  async function completeOffline() {
+    if (!can(role, "sales.create")) {
+      setError("This sign-in cannot sell.");
+      return;
+    }
+    const priced: Array<{ productId: string; name: string; quantity: string; sellingPrice: string; line: string }> = [];
+    for (const line of lines) {
+      const special = customerId ? await customerPrice(shopId, customerId, line.productId) : null;
+      const unit = special || line.cachedPrice || line.listPrice;
+      const money = unit ? moneyInput(unit) : null;
+      const quantity = stockInput(line.quantity);
+      const lineTotal = money && quantity ? lineMoney(money, quantity) : null;
+      if (!money || !quantity || !lineTotal) {
+        setError("Product not available offline.\nConnect to the internet to search this product.");
+        return;
+      }
+      priced.push({ productId: line.productId, name: line.name, quantity, sellingPrice: money, line: lineTotal });
+    }
+    const total = sumMoney(priced.map((item) => item.line));
+    if (!total) {
+      setError("Wait for the bill total.");
+      return;
+    }
+    const payments: Array<{ method: "CASH" | "UPI"; amount: string }> = [];
+    if (payMode === "CASH" || payMode === "UPI") payments.push({ method: payMode, amount: total });
+    if (payMode === "SPLIT") {
+      const cash = moneyInput(cashPart);
+      const upi = moneyInput(upiPart);
+      if (cash && cash !== "0.00") payments.push({ method: "CASH", amount: cash });
+      if (upi && upi !== "0.00") payments.push({ method: "UPI", amount: upi });
+    }
+    const totalPaise = toPaise(total);
+    const paid = payments.reduce((sum, payment) => sum + (toPaise(payment.amount) ?? 0n), 0n);
+    if (payMode === "CREDIT" || (!customerId && paid !== totalPaise)) {
+      if (!customerId) {
+        setError(payMode === "CREDIT" ? "Customer required" : "A walk-in sale must be paid in full. Select a customer for credit.");
+        return;
+      }
+      const customer = await getCustomer(shopId, customerId);
+      if (!customer) {
+        setError("Customer not available offline.\nConnect to internet.");
+        return;
+      }
+      if (Date.now() - Date.parse(customer.cachedAt) > CREDIT_CACHE_MS) {
+        setError("Connect to the internet to refresh this customer before a credit sale.");
+        return;
+      }
+    }
+    if (totalPaise !== null && paid > totalPaise) {
+      setError("Payment is more than the bill.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const sale = await enqueueSale({
+        tenantId: shopId,
+        userId,
+        customerId,
+        customerName,
+        items: priced.map((item) => ({
+          productId: item.productId,
+          name: item.name,
+          quantity: item.quantity,
+          sellingPrice: item.sellingPrice,
+        })),
+        payments,
+      });
+      setOfflineDone(sale);
+      clear();
+      void queryClient.invalidateQueries({ queryKey: ["pos"] });
+    } catch (caught) {
+      setError(caught instanceof OfflineStoreError ? caught.message : "The sale could not be saved on this device.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!offlineDone) return;
+    return onQueueChange(() => {
+      void salesForShop(shopId).then((sales) => {
+        const next = sales.find((sale) => sale.localId === offlineDone.localId);
+        if (next) setOfflineDone(next);
+      });
+    });
+  }, [offlineDone, shopId]);
+
+  if (offlineDone) {
+    const synced = offlineDone.status === "SYNCED" && offlineDone.serverSaleNumber;
+    return (
+      <section className="mx-auto flex w-full max-w-lg flex-col gap-4">
+        <p className="text-sm font-semibold text-muted">OFFLINE</p>
+        <h1 className="text-3xl font-semibold">{synced ? "Sale synced" : "Sale saved successfully"}</h1>
+        <article className="rounded-2xl bg-card p-4">
+          {synced ? (
+            <>
+              <p className="text-muted">Bill</p>
+              <p className="text-2xl font-semibold">{offlineDone.serverSaleNumber}</p>
+            </>
+          ) : (
+            <>
+              <p>Waiting for internet</p>
+              <p className="mt-3 text-muted">Local ref</p>
+              <p className="text-2xl font-semibold">{offlineDone.localRef}</p>
+            </>
+          )}
+        </article>
+        <Button
+          onClick={() => {
+            setOfflineDone(null);
+          }}
+        >
+          New sale
+        </Button>
+        {synced && offlineDone.serverSaleId ? (
+          <Link to={`/sales/${offlineDone.serverSaleId}`} className="text-center font-semibold text-accent">
+            View sale
+          </Link>
+        ) : null}
+      </section>
+    );
   }
 
   if (done) {
@@ -202,6 +444,41 @@ export function SellPage() {
     <section className="mx-auto grid w-full max-w-5xl gap-4 lg:grid-cols-[1.1fr_0.9fr]">
       <div className="flex flex-col gap-3">
         <h1 className="text-2xl font-semibold">Sell</h1>
+        {resume ? (
+          <article className="rounded-2xl bg-card p-4">
+            <p className="font-semibold">Resume previous sale?</p>
+            <div className="mt-3 flex gap-2">
+              <Button
+                onClick={() => {
+                  useCart.setState({
+                    lines: resume.lines,
+                    customerId: resume.customerId,
+                    customerName: resume.customerName,
+                  });
+                  setResume(null);
+                }}
+              >
+                Resume
+              </Button>
+              <Button
+                tone="quiet"
+                onClick={() => {
+                  void saveCart({ tenantId: shopId, lines: [], customerId: null, customerName: null });
+                  setResume(null);
+                }}
+              >
+                Discard
+              </Button>
+            </div>
+          </article>
+        ) : null}
+        {catalogUpdatedAt ? (
+          <p className="text-sm text-muted">
+            {Date.now() - Date.parse(catalogUpdatedAt) > 24 * 60 * 60 * 1000
+              ? "Product data may be outdated. Connect to internet to refresh."
+              : `Products updated ${catalogUpdatedAt.slice(0, 16).replace("T", " ")}`}
+          </p>
+        ) : null}
         <input
           ref={searchRef}
           className={controlClass}
@@ -223,6 +500,9 @@ export function SellPage() {
           }}
         />
         {found.isLoading ? <p>Loading products...</p> : null}
+        {!online && debounced.trim().length > 0 && !found.isLoading && asList(found.data?.data).length === 0 ? (
+          <p>Product not available offline. Connect to the internet to search this product.</p>
+        ) : null}
         {found.isError ? <ErrorState error={found.error} onRetry={() => void found.refetch()} /> : null}
         <div className="flex flex-col gap-2">
           {asList(found.data?.data).map((item) => {
@@ -239,14 +519,16 @@ export function SellPage() {
                     productId: id,
                     name: asText(row.name),
                     listPrice: asText(row.sellingPrice) || null,
-                    stock: stockByProduct.get(id) ?? null,
+                    cachedPrice: asText(row.sellingPrice) || null,
+                    stock: online ? (stockByProduct.get(id) ?? null) : asText(row.quantity) || null,
                   })
                 }
               >
                 <span className="block text-lg font-semibold">{asText(row.name)}</span>
                 <span className="text-muted">
                   <Money value={asText(row.sellingPrice)} />
-                  {stockByProduct.has(id) ? ` · Stock: ${formatQty(stockByProduct.get(id))}` : ""}
+                  {online && stockByProduct.has(id) ? ` · Stock: ${formatQty(stockByProduct.get(id))}` : ""}
+                  {!online && asText(row.quantity) ? ` · Estimated stock: ${formatQty(asText(row.quantity))}` : ""}
                 </span>
               </button>
             );
@@ -258,7 +540,7 @@ export function SellPage() {
         {lines.length === 0 ? <p className="text-muted">Search or scan a product.</p> : null}
         {lines.map((line) => {
           const priced = quoted.get(line.productId);
-          const unit = asText(priced?.unitPrice) || line.listPrice || "";
+          const unit = online ? asText(priced?.unitPrice) || line.listPrice || "" : line.cachedPrice || line.listPrice || "";
           const source = asText(priced?.priceSource);
           return (
             <div key={line.productId} className="border-b border-line pb-3">
@@ -268,10 +550,11 @@ export function SellPage() {
                   <p className="text-sm text-muted">
                     {formatQty(line.quantity)} × <Money value={unit} />
                     {source === "CUSTOMER" ? " · Customer price" : ""}
+                    {!online && line.stock ? ` · Estimated stock: ${formatQty(line.stock)}` : ""}
                   </p>
                 </div>
                 <p className="font-semibold">
-                  <Money value={asText(priced?.lineTotal) || unit} />
+                  <Money value={online ? asText(priced?.lineTotal) || unit : lineMoney(unit, line.quantity) || unit} />
                 </p>
               </div>
               <div className="mt-2 flex gap-2">
@@ -290,7 +573,7 @@ export function SellPage() {
         })}
         <div className="flex items-center justify-between text-xl font-semibold">
           <span>Total</span>
-          <Money value={asText(quoteData?.total)} />
+          <Money value={online ? asText(quoteData?.total) : offlineTotal(lines)} />
         </div>
         {quote.isError ? <ErrorState error={quote.error} onRetry={() => void quote.refetch()} /> : null}
         <Field label="Customer">
@@ -327,9 +610,16 @@ export function SellPage() {
               </button>
             );
           })}
-          <Link to="/customers?new=1" className="font-semibold text-accent">
-            + Add customer
-          </Link>
+          {!online && debouncedCustomer.trim().length > 0 && asList(people.data?.data).length === 0 ? (
+            <p>Customer not available offline. Connect to internet.</p>
+          ) : null}
+          {online ? (
+            <Link to="/customers?new=1" className="font-semibold text-accent">
+              + Add customer
+            </Link>
+          ) : (
+            <p className="text-sm text-muted">Connect to the internet to create/select this customer.</p>
+          )}
         </div>
         <div className="grid grid-cols-2 gap-2">
           {(["CASH", "UPI", "SPLIT", "CREDIT"] as const).map((mode) => (
@@ -356,12 +646,19 @@ export function SellPage() {
         ) : null}
         {payMode === "CREDIT" && !customerId ? <p className="font-semibold text-bad">Customer required</p> : null}
         {error ? <Notice>{error}</Notice> : null}
-        <Button disabled={busy || lines.length === 0 || quote.isLoading} onClick={() => void complete()}>
+        <Button disabled={busy || lines.length === 0 || (online && quote.isLoading)} onClick={() => void complete()}>
           {busy ? "Saving..." : payMode === "UPI" ? "Payment received" : "Complete sale"}
         </Button>
       </aside>
     </section>
   );
+}
+
+function offlineTotal(lines: Array<{ cachedPrice: string | null; listPrice: string | null; quantity: string }>): string {
+  const amounts = lines
+    .map((line) => lineMoney(line.cachedPrice || line.listPrice || "", line.quantity))
+    .filter((value): value is string => Boolean(value));
+  return sumMoney(amounts) ?? "0.00";
 }
 
 function changeQty(current: string, delta: number, set: (next: string) => void, remove: () => void) {
