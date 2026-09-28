@@ -116,6 +116,8 @@ npm run dev
 
 Open `http://localhost:5173`. The API must already be running. The only public setting is `VITE_API_BASE_URL`. Offline selling is described in `docs/offline-pos.md`. The browser keeps a queue. PostgreSQL remains the source of truth.
 
+Production, staging, backups, and operations are in `docs/production-deployment.md`, `docs/backup-recovery.md`, `docs/security.md`, and `docs/operations.md`. Those documents describe the checks in this repository. They do not mean a public host is already deployed.
+
 11. Run tests.
 
 ```bash
@@ -124,7 +126,7 @@ npm run db:test
 npm run test:web
 ```
 
-`npm test` runs the API tests. `npm run test:web` runs the shop app tests. `npm run db:test` runs the database contract tests as the migration role. `npm run db:test` runs the database contract tests as the migration role.
+`npm test` runs the API tests. `npm run test:web` runs the shop app tests. `npm run db:test` runs the database contract tests as the migration role. GitHub Actions runs lint, API tests, web tests, and both builds when a pull request is opened.
 
 ## Application role
 

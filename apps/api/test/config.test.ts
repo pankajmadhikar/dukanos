@@ -3,6 +3,7 @@ import { describe, it } from "@jest/globals";
 import { loadAppConfig } from "../src/common/config/load-app-config";
 
 const appUrl = "postgresql://dukaan_app:dukaan_app_dev_only@localhost:5432/dukaanos";
+const remoteAppUrl = "postgresql://dukaan_app:dukaan_app_dev_only@db.internal:5432/dukaanos";
 
 function env(overrides: Record<string, string> = {}): NodeJS.ProcessEnv {
   return {
@@ -39,14 +40,29 @@ describe("loadAppConfig", () => {
 
   it("rejects a wildcard CORS origin", () => {
     assert.throws(
-      () => loadAppConfig(env({ NODE_ENV: "production", CORS_ORIGINS: "*" })),
+      () =>
+        loadAppConfig(
+          env({
+            NODE_ENV: "production",
+            RATE_LIMIT_STORE: "memory",
+            DATABASE_URL: remoteAppUrl,
+            CORS_ORIGINS: "*",
+          }),
+        ),
       /wildcard/i,
     );
   });
 
   it("requires explicit production origins", () => {
     assert.throws(
-      () => loadAppConfig(env({ NODE_ENV: "production" })),
+      () =>
+        loadAppConfig(
+          env({
+            NODE_ENV: "production",
+            RATE_LIMIT_STORE: "memory",
+            DATABASE_URL: remoteAppUrl,
+          }),
+        ),
       /CORS_ORIGINS is required/,
     );
   });
@@ -55,6 +71,9 @@ describe("loadAppConfig", () => {
     const loaded = loadAppConfig(
       env({
         NODE_ENV: "production",
+        APP_ENV: "production",
+        RATE_LIMIT_STORE: "memory",
+        DATABASE_URL: remoteAppUrl,
         CORS_ORIGINS: "https://shop.example",
         AI_PROVIDER: "openai",
         AI_VISION_MODEL: "gpt-4o-mini",
@@ -73,6 +92,56 @@ describe("loadAppConfig", () => {
     assert.equal(loaded.databaseAppRole, "dukaan_app");
     assert.equal(loaded.ai.provider, "openai");
     assert.equal(loaded.storage.provider, "s3");
+    assert.equal(loaded.appEnv, "production");
+    assert.equal(loaded.rateLimitStore, "memory");
+    assert.equal(loaded.dbPoolSize, 10);
+  });
+
+  it("rejects localhost and plain http when staging is selected", () => {
+    assert.throws(
+      () =>
+        loadAppConfig(
+          env({
+            NODE_ENV: "production",
+            APP_ENV: "staging",
+            RATE_LIMIT_STORE: "memory",
+            DATABASE_URL: appUrl,
+            CORS_ORIGINS: "https://staging.example",
+            AI_PROVIDER: "openai",
+            AI_VISION_MODEL: "gpt-4o-mini",
+            AI_API_KEY: "test-ai-key-value",
+            AI_API_BASE_URL: "https://api.openai.com/v1",
+            OBJECT_STORAGE_PROVIDER: "s3",
+            OBJECT_STORAGE_BUCKET: "intake-private",
+            OBJECT_STORAGE_REGION: "ap-south-1",
+            OBJECT_STORAGE_ACCESS_KEY: "test-access-key",
+            OBJECT_STORAGE_SECRET_KEY: "test-secret-key",
+          }),
+        ),
+      /localhost/,
+    );
+    assert.throws(
+      () =>
+        loadAppConfig(
+          env({
+            NODE_ENV: "production",
+            APP_ENV: "staging",
+            RATE_LIMIT_STORE: "memory",
+            DATABASE_URL: remoteAppUrl,
+            CORS_ORIGINS: "http://staging.example",
+            AI_PROVIDER: "openai",
+            AI_VISION_MODEL: "gpt-4o-mini",
+            AI_API_KEY: "test-ai-key-value",
+            AI_API_BASE_URL: "https://api.openai.com/v1",
+            OBJECT_STORAGE_PROVIDER: "s3",
+            OBJECT_STORAGE_BUCKET: "intake-private",
+            OBJECT_STORAGE_REGION: "ap-south-1",
+            OBJECT_STORAGE_ACCESS_KEY: "test-access-key",
+            OBJECT_STORAGE_SECRET_KEY: "test-secret-key",
+          }),
+        ),
+      /https/,
+    );
   });
 
   it("uses localhost origins in development when CORS_ORIGINS is unset", () => {
@@ -98,6 +167,8 @@ describe("loadAppConfig", () => {
         loadAppConfig(
           env({
             NODE_ENV: "production",
+            RATE_LIMIT_STORE: "memory",
+            DATABASE_URL: remoteAppUrl,
             CORS_ORIGINS: "https://shop.example",
             OTP_PROVIDER: "console",
           }),
@@ -113,6 +184,8 @@ describe("loadAppConfig", () => {
         loadAppConfig(
           env({
             NODE_ENV: "production",
+            RATE_LIMIT_STORE: "memory",
+            DATABASE_URL: remoteAppUrl,
             CORS_ORIGINS: "https://shop.example",
             AI_PROVIDER: "mock",
             AI_API_KEY: secret,

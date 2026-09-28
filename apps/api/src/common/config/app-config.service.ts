@@ -2,6 +2,7 @@ import { Injectable } from "@nestjs/common";
 import {
   AiConfig,
   AppConfig,
+  AppEnvironment,
   loadAppConfig,
   LogLevel,
   NodeEnvironment,
@@ -12,7 +13,11 @@ import {
 @Injectable()
 export class AppConfigService {
   readonly nodeEnv: NodeEnvironment;
+  readonly appEnv: AppEnvironment;
   readonly port: number;
+  readonly jsonBodyLimit: string;
+  readonly dbPoolSize: number;
+  readonly rateLimitStore: "memory";
   readonly databaseUrl: string;
   readonly apiPrefix: string;
   readonly logLevel: LogLevel;
@@ -34,7 +39,11 @@ export class AppConfigService {
   constructor() {
     const loaded: AppConfig = loadAppConfig(process.env);
     this.nodeEnv = loaded.nodeEnv;
+    this.appEnv = loaded.appEnv;
     this.port = loaded.port;
+    this.jsonBodyLimit = loaded.jsonBodyLimit;
+    this.dbPoolSize = loaded.dbPoolSize;
+    this.rateLimitStore = loaded.rateLimitStore;
     this.databaseUrl = loaded.databaseUrl;
     this.apiPrefix = loaded.apiPrefix;
     this.logLevel = loaded.logLevel;

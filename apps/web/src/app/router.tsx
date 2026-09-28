@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Component, type ReactNode } from "react";
 import { createBrowserRouter, RouterProvider, type RouteObject } from "react-router";
 import { RequireAuth, RequireShop, Shell } from "../components/shell";
+import { reportClientError } from "../lib/report-error";
 import { ClosingPage } from "../pages/closing";
 import { CustomerDetailPage, CustomersPage } from "../pages/customers";
 import { DashboardPage } from "../pages/dashboard";
@@ -98,6 +99,10 @@ class ShopBoundary extends Component<{ children: ReactNode }, { failed: boolean 
 
   static getDerivedStateFromError(): { failed: boolean } {
     return { failed: true };
+  }
+
+  componentDidCatch(error: Error): void {
+    reportClientError(error.message);
   }
 
   render() {

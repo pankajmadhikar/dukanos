@@ -14,6 +14,7 @@ import { AppConfigModule } from "./common/config/app-config.module";
 import { AllExceptionsFilter } from "./common/errors/all-exceptions.filter";
 import { RequestLoggingInterceptor } from "./common/interceptors/request-logging.interceptor";
 import { LoggingModule } from "./common/logging/logging.module";
+import { JsonBodyMiddleware } from "./common/middleware/json-body.middleware";
 import { SecurityMiddleware } from "./common/middleware/security.middleware";
 import { createValidationPipe } from "./common/pipes/create-validation-pipe";
 import { RequestContextMiddleware } from "./context/request-context.middleware";
@@ -56,6 +57,7 @@ import { TenantsModule } from "./tenants/tenants.module";
     HealthModule,
   ],
   providers: [
+    JsonBodyMiddleware,
     SecurityMiddleware,
     { provide: APP_PIPE, useFactory: () => createValidationPipe() },
     { provide: APP_FILTER, useClass: AllExceptionsFilter },
@@ -66,7 +68,7 @@ import { TenantsModule } from "./tenants/tenants.module";
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer): void {
     consumer
-      .apply(SecurityMiddleware, RequestContextMiddleware)
+      .apply(JsonBodyMiddleware, SecurityMiddleware, RequestContextMiddleware)
       .forRoutes({ path: "{*path}", method: RequestMethod.ALL });
   }
 }

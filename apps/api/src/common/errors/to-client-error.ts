@@ -39,6 +39,14 @@ export function toClientError(exception: unknown): ResolvedError {
     };
   }
 
+  if (isPayloadTooLarge(exception)) {
+    return {
+      status: HttpStatus.PAYLOAD_TOO_LARGE,
+      code: ErrorCode.VALIDATION_ERROR,
+      message: "Request body is too large.",
+    };
+  }
+
   if (exception instanceof HttpException) {
     const mapped = messageForStatus(exception.getStatus());
     return { status: exception.getStatus(), ...mapped };
@@ -65,6 +73,15 @@ export function clientErrorBody(
     error.details = resolved.details;
   }
   return { status: resolved.status, body: { success: false, error } };
+}
+
+function isPayloadTooLarge(exception: unknown): boolean {
+  if (typeof exception !== "object" || exception === null) {
+    return false;
+  }
+  const status = "status" in exception ? exception.status : undefined;
+  const type = "type" in exception ? exception.type : undefined;
+  return status === 413 || type === "entity.too.large";
 }
 
 function messageForStatus(status: number): {

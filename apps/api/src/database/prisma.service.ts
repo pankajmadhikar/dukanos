@@ -22,10 +22,10 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     config: AppConfigService,
     private readonly logger: AppLogger,
   ) {
-    const datasourceUrl =
-      config.nodeEnv === "test"
-        ? withConnectionLimit(config.databaseUrl, testPoolSize())
-        : config.databaseUrl;
+    const datasourceUrl = withConnectionLimit(
+      config.databaseUrl,
+      config.nodeEnv === "test" ? testPoolSize() : config.dbPoolSize,
+    );
     this.client = new PrismaClient({
       datasourceUrl,
       errorFormat: "minimal",

@@ -243,7 +243,11 @@ GET /api/v1/health/ready
 GET /api/docs
 ```
 
-Liveness does not touch PostgreSQL. Readiness runs `SELECT 1`. Swagger is mounted outside production.
+Liveness does not touch PostgreSQL. Readiness runs `SELECT 1`. An AI or storage outage does not fail readiness. Swagger is off when `APP_ENV` is `staging` or `production`.
+
+`APP_ENV` is `development`, `test`, `staging`, or `production`. Staging and production require `NODE_ENV=production`, `RATE_LIMIT_STORE=memory`, HTTPS CORS origins, and a database host that is not localhost. The JSON body limit defaults to `256kb`. The Prisma pool size defaults to 5 in development and 10 in staging and production, capped at 20. Logs are JSON and include `service` and `environment`. The intake worker logs start, success counts, and failures. Those counters are not on the public health route.
+
+Production deployment, backups, and the security checklist are in `docs/production-deployment.md`, `docs/backup-recovery.md`, `docs/security.md`, and `docs/operations.md`.
 
 ## Shutdown
 

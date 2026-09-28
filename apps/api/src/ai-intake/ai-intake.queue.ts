@@ -18,6 +18,18 @@ export class AiIntakeQueue implements OnModuleDestroy {
   private handler: ((job: IntakeJob) => Promise<void>) | null = null;
   private readonly pending = new Set<string>();
   private readonly timers = new Set<NodeJS.Timeout>();
+  processed = 0;
+  failed = 0;
+  lastSuccessAt: string | null = null;
+
+  markSuccess(): void {
+    this.processed += 1;
+    this.lastSuccessAt = new Date().toISOString();
+  }
+
+  markFailure(): void {
+    this.failed += 1;
+  }
 
   register(handler: (job: IntakeJob) => Promise<void>): void {
     this.handler = handler;

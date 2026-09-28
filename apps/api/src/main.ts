@@ -8,7 +8,7 @@ import { redact } from "./common/logging/redact";
 import { configureApp } from "./configure-app";
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  const app = await NestFactory.create(AppModule, { bufferLogs: true, bodyParser: false });
   const config = app.get(AppConfigService);
   const logger = app.get(AppLogger);
   configureApp(app);

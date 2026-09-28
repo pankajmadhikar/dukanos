@@ -83,6 +83,8 @@ export class AppLogger implements LoggerService {
     const line = {
       timestamp: new Date().toISOString(),
       level: entry.level,
+      service: "dukaanos-api",
+      environment: this.config.appEnv,
       message: redact(entry.message),
       requestId: store?.requestId ?? null,
       userId: store?.userId ?? null,

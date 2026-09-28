@@ -3,5 +3,7 @@ dist/
 apps/web/dev-dist/
 coverage/
 .env
+.env.*
+!.env.example
 *.log
 *.tsbuildinfo

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: dukaanos
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d dukaanos"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_ADMIN_URL: postgresql://postgres:postgres@localhost:5432/dukaanos
+      DATABASE_URL: postgresql://dukaan_app:dukaan_app_dev_only@localhost:5432/dukaanos
+      SESSION_SECRET: ci-session-secret-value
+      OTP_PEPPER: ci-otp-pepper-value
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm ci --prefix apps/web
+      - run: npx prisma validate
+      - run: npx prisma migrate deploy
+      - run: npm run db:ensure-app-role
+      - run: npm run lint
+      - run: npx jest --runInBand apps/api/test/config.test.ts
+      - run: npm test
+      - run: npm run test:web
+      - run: npm run build
+      - run: npm run build:web

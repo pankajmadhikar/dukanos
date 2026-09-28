@@ -32,6 +32,7 @@ export default defineConfig({
       devOptions: { enabled: false },
     }),
   ],
+  build: { sourcemap: false },
   server: { port: 5173 },
   test: {
     environment: "jsdom",
