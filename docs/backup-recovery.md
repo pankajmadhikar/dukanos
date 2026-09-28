@@ -6,7 +6,7 @@ PostgreSQL is the source of truth. Redis is not used. Offline IndexedDB and AI d
 
 `scripts/backup-database.sh` runs `pg_dump --format=custom` using `DATABASE_ADMIN_URL`. It refuses a host other than localhost unless `ALLOW_REMOTE_BACKUP=1`. The default directory is `/tmp/dukaanos-backups`, which is outside the git tree and must not be a public web bucket.
 
-The script does not schedule itself. An operator has to run it daily and copy the file to another machine or an encrypted private bucket. This repository does not enable point-in-time recovery.
+The script does not schedule itself. An operator has to run it daily and copy the file to another machine or an encrypted private bucket. This repository does not enable point-in-time recovery. No production database exists yet, so there is no managed backup schedule, off-site copy, or measured production RPO/RTO.
 
 Until that copy exists off the database machine, the only backup is local and the restore point is whenever the script was last run.
 

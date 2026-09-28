@@ -116,7 +116,7 @@ npm run dev
 
 Open `http://localhost:5173`. The API must already be running. The only public setting is `VITE_API_BASE_URL`. Offline selling is described in `docs/offline-pos.md`. The browser keeps a queue. PostgreSQL remains the source of truth.
 
-Production, staging, backups, and operations are in `docs/production-deployment.md`, `docs/backup-recovery.md`, `docs/security.md`, and `docs/operations.md`. Those documents describe the checks in this repository. They do not mean a public host is already deployed.
+Production, staging, backups, and operations are in `docs/production-deployment.md`, `docs/backup-recovery.md`, `docs/security.md`, and `docs/operations.md`. GitHub CI has passed on `main`. No staging or production host is deployed.
 
 11. Run tests.
 

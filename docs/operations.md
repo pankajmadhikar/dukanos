@@ -17,7 +17,7 @@ Each line has `timestamp`, `level`, `service`, `environment`, `message`, and, wh
 
 ## What to watch
 
-Watch API 5xx from the JSON logs, readiness failures, PostgreSQL connections against `DB_POOL_SIZE` (default 10 in production, maximum 20), backup script failures, and intake `operation=worker` errors. There is no alert vendor in this repository. An operator has to ship the JSON logs to whatever system they already run.
+Watch API 5xx from the JSON logs, readiness failures, PostgreSQL connections against `DB_POOL_SIZE` (default 10 in production, maximum 20), backup script failures, and intake `operation=worker` errors. There is no alert vendor in this repository, and none was attached, because no staging or production host exists. An operator has to ship the JSON logs to whatever system they already run after a host exists.
 
 ## Retention
 

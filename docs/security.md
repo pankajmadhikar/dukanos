@@ -34,4 +34,5 @@ Business commands write `audit_logs` inside the same transaction as the change. 
 - Frontend has only `VITE_API_BASE_URL`.
 - HTTPS, a real staging host, and SMS delivery are not configured in this repository.
 - Shared rate limiting is not implemented.
-- Error monitoring is structured logs, not an external product.
+- Error monitoring is structured logs, not an external product. No vendor was added, because there is no deployed environment to attach one to.
+- `deepmerge-ts` 7.1.5 (GHSA-ggr8-5vv4-36mx) is pinned by `@prisma/config`, which the Prisma CLI uses to merge its own config file. The API process does not import it. Prisma 6.19.3 and 7.10.0 still pin 7.1.5, so upgrading Prisma does not clear the advisory. The crash needs a self-referential object graph, not a normal shop request. The accepted decision is to leave Prisma unchanged until Prisma publishes a patched `@prisma/config`.

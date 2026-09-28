@@ -1,0 +1,68 @@
+# One API process and one PostgreSQL 18 database.
+# Do not add a second instance. Rate limits and the intake queue are process-local.
+# Do not attach babyto.in or www.babyto.in to this service.
+services:
+  - type: web
+    name: dukaanos-api
+    runtime: node
+    plan: starter
+    branch: main
+    numInstances: 1
+    autoDeployTrigger: checksPass
+    buildCommand: npm ci --include=dev && npx prisma generate && npm run build
+    preDeployCommand: npx prisma migrate deploy && npm run db:ensure-app-role
+    startCommand: npm run start:prod
+    healthCheckPath: /api/v1/health/live
+    domains:
+      - api.dukanos.babyto.in
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: NODE_ENV
+        value: production
+      - key: CORS_ORIGINS
+        value: https://dukanos.babyto.in
+      - key: RATE_LIMIT_STORE
+        value: memory
+      - key: JSON_BODY_LIMIT
+        value: 256kb
+      - key: DB_POOL_SIZE
+        value: "10"
+      - key: DATABASE_APP_ROLE
+        value: dukaan_app
+      - key: AI_PROVIDER
+        value: openai
+      - key: AI_API_BASE_URL
+        value: https://api.openai.com/v1
+      - key: OBJECT_STORAGE_PROVIDER
+        value: s3
+      - key: DATABASE_ADMIN_URL
+        fromDatabase:
+          name: dukaanos-postgres
+          property: connectionString
+      - key: DATABASE_URL
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: OTP_PEPPER
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: AI_VISION_MODEL
+        sync: false
+      - key: OBJECT_STORAGE_BUCKET
+        sync: false
+      - key: OBJECT_STORAGE_REGION
+        sync: false
+      - key: OBJECT_STORAGE_ENDPOINT
+        sync: false
+      - key: OBJECT_STORAGE_ACCESS_KEY
+        sync: false
+      - key: OBJECT_STORAGE_SECRET_KEY
+        sync: false
+
+databases:
+  - name: dukaanos-postgres
+    plan: basic-256mb
+    postgresMajorVersion: "18"
+    databaseName: dukaanos
