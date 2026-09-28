@@ -1,0 +1,69 @@
+@import "tailwindcss";
+
+:root {
+  --paper: #f4efe6;
+  --ink: #1c1917;
+  --card: #fffdf8;
+  --line: #e6dccb;
+  --accent: #c2410c;
+  --accent-ink: #fff7ed;
+  --good: #3f6212;
+  --warn: #a16207;
+  --bad: #b91c1c;
+  --muted: #78716c;
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  --paper: #1c1917;
+  --ink: #f5f0e8;
+  --card: #292524;
+  --line: #44403c;
+  --accent: #fb923c;
+  --accent-ink: #1c1917;
+  --good: #bef264;
+  --warn: #fcd34d;
+  --bad: #fca5a5;
+  --muted: #a8a29e;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --font-sans: "Source Sans 3", "Segoe UI", sans-serif;
+  --color-paper: var(--paper);
+  --color-ink: var(--ink);
+  --color-card: var(--card);
+  --color-line: var(--line);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-good: var(--good);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-muted: var(--muted);
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font-sans);
+}
+
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+button,
+a,
+input,
+select,
+textarea {
+  font: inherit;
+}

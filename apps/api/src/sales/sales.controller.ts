@@ -13,7 +13,7 @@ import { CurrentTenant, CurrentTenantPrincipal } from "../common/decorators/curr
 import { CurrentUser, CurrentUserPrincipal } from "../common/decorators/current-user.decorator";
 import { RequiresTenant } from "../common/decorators/requires-tenant.decorator";
 import { RequestContextService } from "../context/request-context.service";
-import { CreateSaleDto, ListSalesQuery } from "./dto/sale.dto";
+import { CreateSaleDto, ListSalesQuery, QuoteSaleDto } from "./dto/sale.dto";
 import { presentProductSale, presentSale } from "./sales.presenter";
 import { saleActor } from "./sales-access";
 import { SalesService } from "./sales.service";
@@ -52,6 +52,23 @@ export class SalesController {
     const actor = saleActor(user, tenant);
     const sale = await this.sales.create(actor, body, idempotencyKey);
     return { data: presentSale(sale, actor.role, true), requestId: this.requestId() };
+  }
+
+  @Post("quote")
+  @HttpCode(200)
+  @ApiOperation({
+    summary: "Check selling prices",
+    description:
+      "Returns the selling price the next sale would charge for these products and this customer. Nothing is saved and stock does not change.",
+  })
+  async quote(
+    @CurrentUser() user: CurrentUserPrincipal,
+    @CurrentTenant() tenant: CurrentTenantPrincipal,
+    @Body() body: QuoteSaleDto,
+  ) {
+    const actor = saleActor(user, tenant);
+    const data = await this.sales.quote(actor, body);
+    return { data, requestId: this.requestId() };
   }
 
   @Get()

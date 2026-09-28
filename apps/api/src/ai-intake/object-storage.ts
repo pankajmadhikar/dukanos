@@ -1,4 +1,5 @@
 import { Injectable } from "@nestjs/common";
+import { AppConfigService } from "../common/config/app-config.service";
 
 export interface UploadRequest {
   objectKey: string;
@@ -52,10 +53,13 @@ export const OBJECT_STORAGE = Symbol("OBJECT_STORAGE");
 export class MockObjectStorage implements ObjectStorage {
   private readonly objects = new Map<string, { contentType: string; bytes: Buffer }>();
 
+  constructor(private readonly config: AppConfigService) {}
+
   async createUploadUrl(input: UploadRequest): Promise<PresignedUpload> {
     const expiresAt = new Date(Date.now() + input.expiresInSeconds * 1000);
+    const key = encodeURIComponent(input.objectKey);
     return {
-      url: `http://127.0.0.1/mock-storage/${encodeURIComponent(input.objectKey)}`,
+      url: `http://127.0.0.1:${this.config.port}/${this.config.apiPrefix}/v1/dev/mock-storage/${key}`,
       method: "PUT",
       headers: { "content-type": input.contentType },
       expiresAt: expiresAt.toISOString(),

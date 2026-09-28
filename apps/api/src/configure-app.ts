@@ -1,5 +1,6 @@
 import { INestApplication, VersioningType } from "@nestjs/common";
 import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
+import { raw } from "express";
 import { AppConfigService } from "./common/config/app-config.service";
 import { AppLogger } from "./common/logging/app-logger.service";
 
@@ -13,6 +14,10 @@ export function configureApp(app: INestApplication): void {
     disable: (setting: string) => void;
   };
   server.disable("x-powered-by");
+  app.use(
+    `/${config.apiPrefix}/v1/dev/mock-storage`,
+    raw({ type: "*/*", limit: "12mb" }),
+  );
   app.setGlobalPrefix(config.apiPrefix);
   app.enableVersioning({
     type: VersioningType.URI,

@@ -10,6 +10,8 @@ export default tseslint.config(
       "node_modules/**",
       "prisma/migrations/**",
       "coverage/**",
+      "apps/web/dist/**",
+      "apps/web/dev-dist/**",
     ],
   },
   js.configs.recommended,
@@ -25,6 +27,12 @@ export default tseslint.config(
         "error",
         { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
       ],
+    },
+  },
+  {
+    files: ["apps/web/**/*.{ts,tsx}"],
+    languageOptions: {
+      globals: { ...globals.browser },
     },
   },
 );

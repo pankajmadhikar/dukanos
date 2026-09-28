@@ -1,6 +1,7 @@
 import { HttpStatus, Injectable } from "@nestjs/common";
 import { AdjustmentReason, MovementType, Prisma } from "@prisma/client";
 import { AuditRecorder, ShopAuditAction } from "../audit/audit-recorder";
+import { formatStock } from "../catalog/decimal";
 import { ShopDb } from "../database/prisma.types";
 import { AppException } from "../common/errors/app.exception";
 import { ErrorCode } from "../common/errors/error-codes";
@@ -105,9 +106,14 @@ export class InventoryLedgerService {
     const oldAverage = locked && locked.average_cost !== null ? asDecimal(locked.average_cost) : null;
     const quantityAfter = oldQuantity.plus(delta);
     if (quantityAfter.isNeg()) {
+      const product = await tx.product.findFirst({
+        where: { tenantId: command.tenantId, id: command.productId },
+        select: { name: true },
+      });
+      const name = product?.name ?? "this product";
       throw new AppException(
         ErrorCode.INSUFFICIENT_STOCK,
-        "Not enough stock for this product.",
+        `Not enough stock for ${name}. Available: ${plainQuantity(oldQuantity)}. Requested: ${plainQuantity(command.quantity)}.`,
         HttpStatus.CONFLICT,
       );
     }
@@ -469,4 +475,9 @@ function asDecimal(value: unknown): Prisma.Decimal {
     return value;
   }
   return new Prisma.Decimal(String(value));
+}
+
+function plainQuantity(value: Prisma.Decimal): string {
+  const text = formatStock(value) ?? "0.000";
+  return text.replace(/0+$/, "").replace(/\.$/, "");
 }

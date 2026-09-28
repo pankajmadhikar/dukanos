@@ -5,6 +5,9 @@
   "description": "DukaanOS modular monolith",
   "scripts": {
     "dev": "nest start --watch",
+    "dev:web": "npm --prefix apps/web run dev",
+    "build:web": "npm --prefix apps/web run build",
+    "test:web": "npm --prefix apps/web run test",
     "build": "nest build",
     "start": "nest start",
     "start:prod": "node dist/main.js",

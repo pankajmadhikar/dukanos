@@ -6,6 +6,7 @@ import { DatabaseModule } from "../database/database.module";
 import { InventoryModule } from "../inventory/inventory.module";
 import { PurchasesModule } from "../purchases/purchases.module";
 import { AiIntakeController } from "./ai-intake.controller";
+import { MockStorageController } from "./mock-storage.controller";
 import { AiIntakeRateLimiter } from "./ai-intake-rate-limiter";
 import { AiIntakeQueue } from "./ai-intake.queue";
 import { AiIntakeService } from "./ai-intake.service";
@@ -24,7 +25,7 @@ import { S3ObjectStorage } from "./s3-object-storage";
  */
 @Module({
   imports: [DatabaseModule, AuditModule, CatalogModule, InventoryModule, PurchasesModule],
-  controllers: [AiIntakeController],
+  controllers: [AiIntakeController, MockStorageController],
   providers: [
     AiIntakeService,
     AiIntakeQueue,

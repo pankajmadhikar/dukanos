@@ -185,7 +185,7 @@ describe("ai intake", () => {
     assert.equal(uploaded.status, 200, JSON.stringify(uploaded.body));
     assert.equal(uploaded.body.data.method, "PUT");
     assert.equal(uploaded.body.data.headers["content-type"], "image/jpeg");
-    assert.match(uploaded.body.data.url, /^http:\/\/127\.0\.0\.1\/mock-storage\//);
+    assert.match(uploaded.body.data.url, /^http:\/\/127\.0\.0\.1:\d+\/api\/v1\/dev\/mock-storage\//);
     assert.match(uploaded.body.data.objectKey, new RegExp(`^tenants/${shopId}/ai-intake/${intakeId}/`));
     assert.equal(String(uploaded.body.data.objectKey).includes("shop-products"), false);
     assert.equal(JSON.stringify(uploaded.body).includes("secret"), false);

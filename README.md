@@ -1,10 +1,10 @@
 # DukaanOS
 
-DukaanOS is a modular monolith for Indian retail shops. This repository currently contains the PostgreSQL contract and the NestJS API foundation.
+DukaanOS is a modular monolith for Indian retail shops. The repository contains the PostgreSQL contract, the NestJS API, and the shopkeeper web app in `apps/web`.
 
 PostgreSQL 18 is required. The schema uses PostgreSQL 18 `uuidv7()`.
 
-The API is one NestJS process. Sales, inventory, customers, and AI intake are modules inside that process. They are not separate services. Business posting is not implemented yet.
+The API is one NestJS process. Sales, inventory, customers, and AI intake are modules inside that process. They are not separate services. The shop app calls that API. It does not keep its own accounts.
 
 ## Local development
 
@@ -105,14 +105,26 @@ curl -s http://localhost:3000/api/v1/tenants/current \
   -H 'x-dukaan-shop: THE_SHOP_CONTEXT'
 ```
 
-10. Run tests.
+10. Start the shop app in another terminal.
+
+```bash
+cd apps/web
+cp .env.example .env
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173`. The API must already be running. The only public setting is `VITE_API_BASE_URL`.
+
+11. Run tests.
 
 ```bash
 npm test
 npm run db:test
+npm run test:web
 ```
 
-`npm test` runs the API foundation tests. `npm run db:test` runs the database contract tests as the migration role.
+`npm test` runs the API tests. `npm run test:web` runs the shop app tests. `npm run db:test` runs the database contract tests as the migration role. `npm run db:test` runs the database contract tests as the migration role.
 
 ## Application role
 
@@ -128,7 +140,7 @@ Shop queries belong inside `TenantTransactionService.run`. That opens a Prisma t
 ## Scripts
 
 ```text
-dev start start:prod build lint format
-test test:watch test:e2e
+dev dev:web start start:prod build build:web lint format
+test test:web test:watch test:e2e
 db:validate db:format db:generate db:migrate db:seed db:ensure-app-role db:test
 ```

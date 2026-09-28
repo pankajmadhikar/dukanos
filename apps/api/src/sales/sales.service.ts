@@ -2,14 +2,14 @@ import { createHash } from "node:crypto";
 import { HttpStatus, Injectable } from "@nestjs/common";
 import { MovementType, PaymentMethod, Prisma } from "@prisma/client";
 import { AuditRecorder } from "../audit/audit-recorder";
-import { parseMoney, parseStock } from "../catalog/decimal";
+import { formatMoney, formatStock, parseMoney, parseStock } from "../catalog/decimal";
 import { ProductPricingService } from "../catalog/product-pricing.service";
 import { AppException } from "../common/errors/app.exception";
 import { ErrorCode } from "../common/errors/error-codes";
 import { ShopDb, TenantScope } from "../database/prisma.types";
 import { TenantTransactionService } from "../database/tenant-transaction.service";
 import { InventoryLedgerService } from "../inventory/inventory-ledger.service";
-import { CreateSaleDto, SALE_PAYMENT_METHODS, SalePaymentMethod } from "./dto/sale.dto";
+import { CreateSaleDto, QuoteSaleDto, SALE_PAYMENT_METHODS, SalePaymentMethod } from "./dto/sale.dto";
 import { lineCostAmount, saleLineTotal, saleOutstanding, salePaymentStatus } from "./sale-calculator";
 import { SaleView } from "./sales.presenter";
 
@@ -146,6 +146,29 @@ export class SalesService {
       return {
         data: rows.map((row) => this.toView(row, [], paidBySale.get(row.id) ?? new Prisma.Decimal(0), false)),
         pagination: { page: query.page, limit: query.limit, total },
+      };
+    });
+  }
+
+  async quote(actor: TenantScope, body: QuoteSaleDto) {
+    const prepared = prepareItems(
+      body.items.map((item) => ({
+        productId: item.productId,
+        quantity: item.quantity,
+      })),
+    );
+    return this.transactions.run(actor, async (tx) => {
+      const priced = await this.priceItems(tx, actor.tenantId, body.customerId, prepared);
+      const total = priced.reduce((sum, item) => sum.plus(item.lineTotal), new Prisma.Decimal(0));
+      return {
+        items: priced.map((item) => ({
+          productId: item.productId,
+          quantity: formatStock(item.quantity),
+          unitPrice: formatMoney(item.unitPrice),
+          lineTotal: formatMoney(item.lineTotal),
+          priceSource: item.priceSource,
+        })),
+        total: formatMoney(total),
       };
     });
   }

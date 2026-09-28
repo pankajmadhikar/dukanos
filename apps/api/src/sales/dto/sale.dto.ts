@@ -99,6 +99,20 @@ export class CreateSaleDto {
   payments?: SalePaymentDto[];
 }
 
+export class QuoteSaleDto {
+  @ApiPropertyOptional({ description: "Omit for a walk-in price check. Prices are not stored." })
+  @IsOptional()
+  @IsUUID()
+  customerId?: string;
+
+  @ApiProperty({ type: [SaleItemDto] })
+  @ArrayMinSize(1)
+  @ArrayMaxSize(50)
+  @ValidateNested({ each: true })
+  @Type(() => SaleItemDto)
+  items!: SaleItemDto[];
+}
+
 export class ListSalesQuery {
   @ApiPropertyOptional()
   @IsOptional()
